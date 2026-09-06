@@ -1,0 +1,27 @@
+# Nothing in this repository is built, and nothing built belongs in it.
+*.exe
+*.obj
+*.pdb
+*.lib
+*.ilk
+bin/
+obj/
+
+# Assets never enter this repository -- see NOTICE.md. Listed so that an accidental
+# copy into the working tree cannot be committed by reflex.
+*.skel
+*.atlas
+*.ttf
+*.otf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+*.gif
+
+# Editors and OS
+.vs/
+.vscode/
+Thumbs.db
+desktop.ini
