@@ -293,17 +293,94 @@ struct Classification {
     char group = 0;
 };
 
+// The fourth naming rule to break, and the last one this file will write.
+//
+// The day room's distant companion has two slots -- `R_Ribbon_Pattern_01` and
+// `L_Ribbon _Pattern_01` -- whose names carry no group and whose art is `BGF/...`,
+// which is neither `BG_` nor `BG/` and so survives the background test. Every other
+// part of her is `Black00_...` and classifies correctly. So she was removed from the
+// still and her two hair ribbons were not: two white strips hanging in the sky
+// outside the window, above an empty chair, baked into the lock-screen wallpaper.
+// Reported against a shipped build.
+//
+// Names have now been wrong four times (`_base` as a ground plate, the A..F letter
+// range, `a_<digit>` as scenery, and this), and the comment at the top of this file
+// has twice said what the answer is: **a rule about a name is a rule about one
+// artist's habit**. So the last word is not a name at all.
+//
+// A ribbon on somebody's head is bound to a bone on their head. `R_Ribbon_Pattern_01`
+// hangs off `Black00_F_Ribbon`, which is a bone the character slot `Black00_F_Ribbon`
+// is already bound to; the room's real scenery hangs off `BG <- All_Layer`. That is
+// the difference, it is in the skeleton rather than in a string, and it survives
+// whatever the next export decides to call things.
+//
+// Two guards, because a closure over a hierarchy is one shared bone away from
+// swallowing the whole room:
+//
+//   * the root is never a character bone -- everything descends from it;
+//   * a bone that a *scenery* slot also uses is never a character bone. `BG` is the
+//     case that matters: were one character part ever bound there, without this the
+//     entire classroom would be promoted with it.
+//
+// And the promotion cannot reach past the two rules that were already right: art
+// under `BG_`/`BG/` and anything isStageDressing names stays scenery, so the desk
+// she leans on does not leave with her.
 inline Classification classify(spine::Skeleton &sk) {
     Classification c;
     c.group = dominantGroup(sk);
-    c.isChar.resize(sk.getSlots().size());
-    for (size_t i = 0; i < sk.getSlots().size(); i++) {
+    const size_t n = sk.getSlots().size();
+    c.isChar.resize(n);
+    for (size_t i = 0; i < n; i++) {
         spine::Slot *slot = sk.getSlots()[i];
-        const bool ch = !isSceneAttachment(slot->getAttachment(), c.group,
-                                           slot->getData().getName().buffer());
-        c.isChar[i] = ch;
-        if (ch) { c.maxIdx = (int)i; if (c.minIdx < 0) c.minIdx = (int)i; }
+        c.isChar[i] = !isSceneAttachment(slot->getAttachment(), c.group,
+                                         slot->getData().getName().buffer());
     }
+
+    // Which bones each side of the partition is bound to.
+    const size_t nb = sk.getBones().size();
+    std::vector<bool> charBone(nb, false), sceneBone(nb, false);
+    for (size_t i = 0; i < n; i++) {
+        spine::Slot *slot = sk.getSlots()[i];
+        if (!slot->getAttachment()) continue;      // a slot with nothing in it is nobody's
+        const int b = slot->getBone().getData().getIndex();
+        if (b < 0 || (size_t)b >= nb) continue;
+        (c.isChar[i] ? charBone : sceneBone)[b] = true;
+    }
+    if (nb) charBone[0] = false;                   // the root belongs to everything
+
+    auto stillScenery = [&](spine::Attachment *att) {
+        if (!att) return true;
+        const std::string path = attachmentPath(att);
+        if (isStageDressing(path)) return true;
+        const std::string ls = lower(path), ln = lower(att->getName().buffer());
+        return ls.rfind("bg_", 0) == 0 || ls.rfind("bg/", 0) == 0 ||
+               ln.rfind("bg_", 0) == 0 || ln.rfind("bg/", 0) == 0;
+    };
+
+    // A promoted slot's own bone becomes a character bone, so a chain of them --
+    // ribbon on a ribbon -- resolves. Bounded by the slot count: each pass promotes
+    // at least one slot or stops.
+    for (bool again = true; again; ) {
+        again = false;
+        for (size_t i = 0; i < n; i++) {
+            if (c.isChar[i]) continue;
+            spine::Slot *slot = sk.getSlots()[i];
+            if (stillScenery(slot->getAttachment())) continue;
+            for (spine::Bone *b = slot->getBone().getParent(); b; b = b->getParent()) {
+                const int bi = b->getData().getIndex();
+                if (bi < 0 || (size_t)bi >= nb) break;
+                if (!charBone[bi] || sceneBone[bi]) continue;
+                c.isChar[i] = true;
+                const int own = slot->getBone().getData().getIndex();
+                if (own >= 0 && (size_t)own < nb && own != 0) charBone[own] = true;
+                again = true;
+                break;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < n; i++)
+        if (c.isChar[i]) { c.maxIdx = (int)i; if (c.minIdx < 0) c.minIdx = (int)i; }
     return c;
 }
 
@@ -486,8 +563,8 @@ inline void describeClassification(spine::Skeleton &sk,
     }
     out("    dominant group '%c', character slots %d..%d of %d\n",
         c.group ? c.group : '?', c.minIdx, c.maxIdx, (int)sk.getSlots().size());
-    out("    %-4s %-30s %-32s %-5s %-6s %-6s %-5s\n",
-        "idx", "slot", "attachment", "group", "alpha", "dress", "char");
+    out("    %-4s %-30s %-32s %-5s %-6s %-6s %-5s %-28s\n",
+        "idx", "slot", "attachment", "group", "alpha", "dress", "char", "bone <- parent");
     for (size_t i = 0; i < sk.getSlots().size(); i++) {
         spine::Slot *s = sk.getSlots()[i];
         const std::string path = attachmentPath(s->getAttachment());
@@ -497,10 +574,20 @@ inline void describeClassification(spine::Skeleton &sk,
         if (!bx0.empty() && bx1[i] > bx0[i])
             std::snprintf(box, sizeof(box), "%.0f,%.0f..%.0f,%.0f",
                           bx0[i], by0[i], bx1[i], by1[i]);
-        out("    %-4d %-30s %-32s %-5c %-6.2f %-6s %-5s %s\n",
+        // Who the slot hangs off. Added after the third naming rule broke: the day
+        // room's `R_Ribbon_Pattern_01` carries no group in its name or its art and
+        // was filed as scenery, and the only thing on the skeleton that says it is
+        // part of a person is the bone it is bound to. A name column cannot show
+        // that; this one can.
+        char bone[64] = "";
+        if (spine::Bone *b = &s->getBone()) {
+            const char *pn = b->getParent() ? b->getParent()->getData().getName().buffer() : "-";
+            std::snprintf(bone, sizeof(bone), "%s <- %s", b->getData().getName().buffer(), pn);
+        }
+        out("    %-4d %-30s %-32s %-5c %-6.2f %-6s %-5s %-28s %s\n",
             (int)i, s->getData().getName().buffer(), path.c_str(),
             g ? g : '-', s->getColor().a,
-            isStageDressing(path) ? "yes" : "", c.isChar[i] ? "CHAR" : "", box);
+            isStageDressing(path) ? "yes" : "", c.isChar[i] ? "CHAR" : "", bone, box);
     }
 }
 

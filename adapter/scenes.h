@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -71,25 +73,52 @@ struct Entry {
 //
 // The same file also carries `key=value` lines. One per line, no sections, no
 // quoting, because the person editing it found this repository through a video and
-// should not have to learn a format to turn the character off.
+// should not have to learn a format to change what they see.
 //
-//     disable_char_layer=false
-//     force_24_hour=false
+//     clock_over_character=false
+//     force_24_hour=true
 //     clock_offset_y=0
 //     experimental=false
-//     follow_time_of_day=false
+//     follow_time_of_day=true
+//
+// Shown with the values they actually default to, which is what a fresh file gets.
+// This block said `false` for both of the last two long after they were flipped, and
+// a stale comment about a default is worse than none: it is the first place anybody
+// looks to answer "what does it do out of the box".
 //
 // A line is a setting if it contains '='; anything else is a scene. That is the
 // whole grammar, and it means a scene name can never be mistaken for a setting or
 // the other way round -- no scene name contains '=' and no key is a bare word.
 struct Settings {
-    // Draw the room and the wake, but never the foreground character. For somebody
-    // who wants the classroom without anybody standing in front of it.
-    bool  disableCharLayer = false;
-    // Show a 24-hour clock regardless of the system's format. An override, not a
-    // default: with this off the clock follows Windows, which is what almost
-    // everyone should want. See localeclock.h.
-    bool  force24Hour = false;
+    // Draw the clock in front of the seated character instead of behind her.
+    //
+    // The clock lives *inside* the room: it is composited at the character's own
+    // depth, with her silhouette subtracted from its alpha, so she stands in front
+    // of the digits the way she would stand in front of anything else in the room.
+    // That is the effect, and in three of the nine scenes it costs some of the time.
+    // Turning this on skips the subtraction and nothing else -- same clock, same
+    // position, same light -- so the time is always whole.
+    //
+    // Off by default: the occlusion is the composition working, the text stays
+    // legible through it, and whether that trade is worth it is the owner's call
+    // rather than this file's.
+    //
+    // This key used to be `disable_char_layer`, which switched off the entire
+    // foreground layer. Nobody wanted a classroom with nobody in it; what people
+    // wanted was to read the clock. The old key also had a bug that made it worse
+    // than useless -- see the test card note in overlay/src/dcomp.h.
+    bool  clockOverCharacter = false;
+    // Show a 24-hour clock regardless of the system's format.
+    //
+    // **On by default, and that is a deliberate break from "follow Windows".** The
+    // scene is the thing people saw in the video and asked for, and in it the clock
+    // is 24-hour; a `PM` hanging off the end of it reads badly at that size and in
+    // that typeface. Following the system format is the technically correct default
+    // and the wrong one for what this is. Owner's call, 2026-09-07.
+    //
+    // Set it to false to follow Windows' own time format and language. See
+    // localeclock.h.
+    bool  force24Hour = true;
     // Added to the clock's vertical position, as a fraction of screen height.
     // Negative moves it up. Resolution-independent, so it survives a monitor change.
     float clockOffsetY = 0.0f;
@@ -100,7 +129,7 @@ struct Settings {
     bool  experimental = false;
     // Pick day scenes between 06:00 and 18:00 and night scenes outside it, instead
     // of choosing from everything active. This is the reference wallpaper's own
-    // rule: `isday = !(spoilerChar && (hr < 6 || hr >= 18))`.
+    // rule: day between 06:00 and 18:00, night outside it.
     //
     // On by default, which the other four settings are not. Every scene ships active,
     // and without this a machine unlocked at three in the morning has a four-in-nine
@@ -116,6 +145,41 @@ struct Settings {
     // here rather than only by the installer -- turning it off in the config should
     // put the machine back without needing to uninstall.
     bool  noLockScreen = true;
+    // Windows blurs the lock-screen picture behind the credential screen, and since
+    // that picture is now the scene's own room (sceneconfig::SetLockScreenImage) the
+    // blur is a real choice rather than an accident: it is the difference between the
+    // room the overlay hands over and the room Windows takes on.
+    //
+    // **On by default, which is Windows' own behaviour.** Turning it off is a
+    // machine-wide policy write, and the crisper handover is not worth making that
+    // decision on somebody's behalf. Owner's call, 2026-09-07.
+    bool  logonBlur = true;
+    // Draw the drifting particles across the whole screen, and keep the whole screen.
+    //
+    // This is the shape of a trade that cannot be avoided, so it is offered as a
+    // choice rather than decided here. Measured 2026-09-07: on the Winlogon desktop
+    // there is no window arrangement that draws a pixel *and* lets a click through it.
+    // A DirectComposition window swallows clicks over its whole rectangle whatever its
+    // alpha; a layered window with per-pixel alpha does the same, measured against a
+    // control in the same session; a window region passes clicks and removes the
+    // drawing with them. Drawing and input are one thing here.
+    //
+    // So the screen has to be divided, and the only question is where:
+    //
+    //   on  (default)  The scene keeps the whole screen and the particles drift across
+    //                  all of it. Windows' credential box and corner buttons are
+    //                  reachable through cut-outs, but a menu that opens from one of
+    //                  those buttons lands back on the scene's side and takes no
+    //                  clicks -- so it has to be driven from the keyboard.
+    //   off            The particles are switched off and the right half of the screen
+    //                  is handed to Windows outright. Everything over there works,
+    //                  menus included. **The character stays** -- she is left of centre
+    //                  and loses nothing.
+    //
+    // Owner's call, 2026-09-07. Naming it after the effect rather than after the
+    // region is deliberate: what somebody gives up is the full-screen effect, and that
+    // is the sentence they should be reading when they decide.
+    bool  fullscreenFx = true;
 };
 
 // Case-insensitive, so `False` and `FALSE` behave. Anything that is not a
@@ -162,11 +226,13 @@ inline Settings ParseSettings(const std::string &text,
         for (char &c : key) c = (char)std::tolower((unsigned char)c);
 
         bool ok = true;
-        if (key == "disable_char_layer")   s.disableCharLayer = ParseBool(val, s.disableCharLayer, &ok);
+        if (key == "clock_over_character") s.clockOverCharacter = ParseBool(val, s.clockOverCharacter, &ok);
         else if (key == "force_24_hour")   s.force24Hour      = ParseBool(val, s.force24Hour, &ok);
         else if (key == "experimental")    s.experimental     = ParseBool(val, s.experimental, &ok);
         else if (key == "follow_time_of_day") s.followTimeOfDay = ParseBool(val, s.followTimeOfDay, &ok);
         else if (key == "no_lock_screen")  s.noLockScreen     = ParseBool(val, s.noLockScreen, &ok);
+        else if (key == "logon_blur")      s.logonBlur        = ParseBool(val, s.logonBlur, &ok);
+        else if (key == "fullscreen_fx")   s.fullscreenFx     = ParseBool(val, s.fullscreenFx, &ok);
         else if (key == "clock_offset_y") {
             // strtof rather than atof: atof cannot report that it read nothing, so
             // `clock_offset_y=up` would silently become 0 and look like it worked.
@@ -349,6 +415,72 @@ inline std::string StillName(int width, int height) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "room-%dx%d.png", width, height);
     return buf;
+}
+
+// ------------------------------------------------------- one still, any screen
+//
+// What size to bake a still at, given the screen it will be shown on.
+//
+// **The answer is always 16:9**, and that is the whole point. The world rect above
+// is authored 2880x1620 -- exactly 16:9 -- so a still baked at 16:9 crops nothing.
+// Uniform-covering an uncropped still onto any screen then produces *exactly* the
+// same world rectangle that roomViewport(W,H) returns for that screen, at every
+// resolution and every aspect. The proof is two lines: with Sw = 2880m, Sh = 1620m,
+//
+//     k = max(Dw/Sw, Dh/Sh) = (1/m) * max(Dw/2880, Dh/1620) = s/m
+//     visible world = (Dw/k)*(2880/Sw) x (Dh/k)*(1620/Sh) = Dw/s x Dh/s
+//
+// which is roomViewport's own answer. regression.exe checks it rather than trusting
+// the algebra.
+//
+// So the still stopped being a per-screen artefact. It used to be baked at the
+// screen's exact size because the cover was drawn stretched to fill, which is only
+// correct when the sizes already match -- and that made a display change (a laptop
+// docked to a monitor, a Surface rotated) leave the machine with no usable still at
+// all. Now the size below is chosen for *sharpness only*: the smallest 16:9 image
+// that still covers this screen without being upscaled. Getting it wrong costs
+// resampling, never geometry.
+//
+// A 1920x1080 panel bakes 1920x1080, a 4K panel bakes 3840x2160, and two 1080p
+// monitors side by side (3840x1080) bake 3840x2160 -- because covering a 32:9 strip
+// from a 16:9 source is driven by the width.
+inline void StillSize(int screenW, int screenH, int *outW, int *outH) {
+    if (screenW < 1) screenW = 1;
+    if (screenH < 1) screenH = 1;
+    // One integer multiplier of 16x9, not a scale applied to each axis separately.
+    //
+    // The difference is the whole correctness of this: rounding the two axes on
+    // their own gave 1366x770 for a 1366x768 laptop, which is 1.774 and not 16:9,
+    // and a bake that is not exactly the world's aspect crops something -- so the
+    // second cover cannot restore it and the identity above stops holding. Measured
+    // as a 6 px error at 1366x768 and 1.5 px at 3440x1440 before this was integer.
+    const int m = (int)std::ceil((std::max)(screenW / 16.0, screenH / 9.0));
+    *outW = 16 * (m < 1 ? 1 : m);
+    *outH = 9  * (m < 1 ? 1 : m);
+}
+
+// The part of a source image that a uniform cover of it onto dstW x dstH shows.
+//
+// Centred on both axes. Shared rather than written twice: the overlay draws the
+// cover with it, and regression.exe proves the identity above with it, so the two
+// cannot drift apart -- which is exactly how the still filename ended up spelled
+// three different ways once before.
+inline void CoverSrc(int srcW, int srcH, int dstW, int dstH,
+                     double *x, double *y, double *w, double *h) {
+    if (srcW < 1 || srcH < 1 || dstW < 1 || dstH < 1) {
+        *x = *y = 0.0; *w = srcW; *h = srcH;
+        return;
+    }
+    // Which axis fills. The other one is the one that gets cropped.
+    if ((double)dstW / dstH > (double)srcW / srcH) {
+        *w = srcW;
+        *h = (double)srcW * dstH / dstW;
+    } else {
+        *h = srcH;
+        *w = (double)srcH * dstW / dstH;
+    }
+    *x = (srcW - *w) * 0.5;
+    *y = (srcH - *h) * 0.5;
 }
 
 }  // namespace scenes
