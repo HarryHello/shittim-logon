@@ -21,6 +21,7 @@ final class SceneRenderer {
     private var vertCapacity = 0
     private var indexCapacity = 0
     private var textures: [Int: MTLTexture] = [:]
+    private var loggedFirstFrame = false
 
     /// Region (pixels) kept fully transparent so the system password field
     /// shows through the scene. x, y, w, h.
@@ -204,6 +205,10 @@ final class SceneRenderer {
             return
         }
 
+        if !loggedFirstFrame {
+            loggedFirstFrame = true
+            say("first frame: batches=\(batchCount) verts=\(vertCount) indices=\(indexCount) pages=\(sb_page_count())")
+        }
         ensureCapacity(vertices: Int(vertCount), indices: Int(indexCount))
         vertBuffer?.contents().copyMemory(from: sv, byteCount: Int(vertCount) * 20)
         indexBuffer?.contents().copyMemory(from: si, byteCount: Int(indexCount) * 2)

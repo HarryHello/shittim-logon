@@ -16,6 +16,7 @@
 
 import AppKit
 import Metal
+import MetalKit
 import QuartzCore
 import CoreGraphics
 import os
@@ -42,7 +43,7 @@ struct Config {
     var sky = true
     var clock = true
     var windowed = false
-    var hole: SIMD4<Float> = SIMD4(0.36, 0.34, 0.28, 0.50) // fractions: x, y, w, h
+    var hole: SIMD4<Float> = SIMD4(0.36, 0.34, 0.28, 0.50) // x, y, w, h fractions
 
     static func load() -> Config {
         var c = Config()
@@ -143,9 +144,35 @@ final class LockWatcher {
     }
 }
 
-// ------------------------------------------------------------- engine
+// ------------------------------------------------------------- metal view
 
-final class Engine: NSObject {
+final class SceneView: MTKView {
+    override var acceptsFirstResponder: Bool { false }
+    // MTKView reports itself opaque; the lock-screen overlay needs the
+    // password cut-out to blend through to the system UI underneath.
+    override var isOpaque: Bool { false }
+
+    override init(frame: CGRect, device: MTLDevice?) {
+        super.init(frame: frame, device: device)
+        isPaused = true                 // resumed when the scene goes on stage
+        enableSetNeedsDisplay = false
+        preferredFramesPerSecond = 60
+        clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        framebufferOnly = true
+        autoResizeDrawable = true
+    }
+
+    required init(coder: NSCoder) { fatalError("not supported") }
+}
+
+final class MetalBox: NSWindow {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+// ------------------------------------------------------------------ engine
+
+final class Engine: NSObject, MTKViewDelegate {
     static let shared = Engine()
 
     let cfg: Config
@@ -153,8 +180,6 @@ final class Engine: NSObject {
     let renderer: SceneRenderer
     let window: MetalBox
     let sceneView: SceneView
-    let metalLayer: CAMetalLayer
-    var displayLink: CADisplayLink?
     var hasCharacter = false
 
     var mounted = false
@@ -165,9 +190,17 @@ final class Engine: NSObject {
     var clockMinute = -1
     let clockFormatter: DateFormatter
 
-    override init() {
+    private(set) var windowed = false
+
+    private override init() {
         cfg = Config.load()
+        windowed = CommandLine.arguments.contains("--windowed")
         var loadedCharacter = false
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            fatalError("no Metal device")
+        }
+        self.device = device
 
         guard sb_load_room(cfg.assets, cfg.room) == 0 else {
             fatalError("could not load room '\(cfg.room)' from '\(cfg.assets)'")
@@ -196,14 +229,10 @@ final class Engine: NSObject {
                     say("character: playing first Idle* -- '\(first)' (character_anim overrides)")
                 }
             } else {
-                say("character '\(cfg.character)' failed to load (rc≠0) -- phase B stays in A")
+                say("character '\(cfg.character)' failed to load -- phase B stays in A")
             }
         }
 
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            fatalError("no Metal device")
-        }
-        self.device = device
         let r: SceneRenderer
         do { r = try SceneRenderer(device: device) } catch {
             fatalError("renderer init failed: \(error)")
@@ -211,14 +240,9 @@ final class Engine: NSObject {
         renderer = r
 
         let screenFrame = NSScreen.main!.frame
-        let sv = SceneView(frame: NSRect(origin: .zero, size: screenFrame.size))
-        sv.wantsLayer = true
+        let sv = SceneView(frame: NSRect(origin: .zero, size: screenFrame.size),
+                           device: device)
         sceneView = sv
-        let ml = sv.layer as! CAMetalLayer
-        ml.device = device
-        ml.pixelFormat = .bgra8Unorm
-        ml.isOpaque = false
-        metalLayer = ml
 
         window = MetalBox(contentRect: screenFrame,
                           styleMask: [.borderless],
@@ -227,32 +251,47 @@ final class Engine: NSObject {
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
-        window.ignoresMouseEvents = true
+        // Input is ignored only while the window serves as the lock-screen
+        // overlay. The windowed development build stays clickable -- otherwise
+        // the dev view cannot even be dragged to the front.
+        window.ignoresMouseEvents = cfg.sky && !windowed
         window.collectionBehavior = [.fullScreenAuxiliary, .stationary,
                                      .canJoinAllSpaces, .ignoresCycle]
         window.canBecomeVisibleWithoutLogin = true
-        window.level = NSWindow.Level(rawValue: Int(Int32.max - 2))
 
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"   // 24-hour: the scene's own convention
         clockFormatter = formatter
         hasCharacter = loadedCharacter
         super.init()
+
+        sv.delegate = self
+        if windowed {
+            makeWindowVisibleForDev()
+        } else if cfg.sky {
+            Sky.bootstrap()
+        } else {
+            say("sky mount disabled (sky=0) -- window stays a plain desktop window")
+        }
+        syncDrawableSize()
     }
 
     func makeWindowVisibleForDev() {
         window.styleMask.insert([.titled, .closable])
         window.setContentSize(NSSize(width: 1280, height: 720))
         window.center()
+        window.level = .normal
         window.makeKeyAndOrderFront(nil)
+        if !windowed { return }   // (kept symmetric; windowed is the only caller)
+        app.activate(ignoringOtherApps: true)
     }
 
     func syncDrawableSize() {
         let scale = window.backingScaleFactor
         let px = sceneView.bounds.applying(CGAffineTransform(scaleX: scale, y: scale)).size
-        metalLayer.drawableSize = px
-        renderer.holeRect = cfg.hole * SIMD4<Float>(Float(px.width), Float(px.height),
-                                                    Float(px.width), Float(px.height))
+        sceneView.drawableSize = px
+        renderer.holeRect = cfg.hole * SIMD4<Float>(
+            Float(px.width), Float(px.height), Float(px.width), Float(px.height))
     }
 
     // MARK: mount / unmount
@@ -264,12 +303,12 @@ final class Engine: NSObject {
             syncDrawableSize()
             window.orderFrontRegardless()
             let rc = Sky.adopt(windowNumber: UInt32(window.windowNumber))
-            displayLink?.isPaused = false
+            sceneView.isPaused = false
             lastFrame = Date().timeIntervalSinceReferenceDate
             lastIdle = 999
             say("mounted over lock screen (adopt rc=\(rc))")
         } else {
-            displayLink?.isPaused = true
+            sceneView.isPaused = true
             phaseArrived = false
             charAlpha = 0
             sb_set_character_alpha(0)
@@ -278,10 +317,12 @@ final class Engine: NSObject {
         }
     }
 
-    // MARK: frame
+    // MARK: MTKViewDelegate
 
-    @objc func tickFrame() {
-        guard mounted else { return }
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func draw(in view: MTKView) {
+        guard mounted || windowed else { return }
         let now = Date().timeIntervalSinceReferenceDate
         var dt = Float(now - lastFrame)
         lastFrame = now
@@ -314,20 +355,16 @@ final class Engine: NSObject {
             }
         }
 
-        renderer.draw(layer: metalLayer, dt: dt)
+        renderer.draw(layer: view.layer as! CAMetalLayer, dt: dt)
     }
-}
 
-// ------------------------------------------------------------ window/view
+    // MARK: diagnostics
 
-final class SceneView: NSView {
-    override var acceptsFirstResponder: Bool { false }
-    override func makeBackingLayer() -> CALayer { CAMetalLayer() }
-}
-
-final class MetalBox: NSWindow {
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
+    func dumpWindowState() {
+        say("window: visible=\(window.isVisible) occlusion=\(window.occlusionState.rawValue) level=\(window.level.rawValue)")
+        say("view: drawable=\(Int(sceneView.drawableSize.width))x\(Int(sceneView.drawableSize.height)) paused=\(sceneView.isPaused) layer=\(String(describing: type(of: sceneView.layer)))")
+        say("app: hidden=\(app.isHidden) windowed=\(windowed)")
+    }
 }
 
 // ------------------------------------------------------------------- main
@@ -336,21 +373,17 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
 let engine = Engine.shared
-
-if CommandLine.arguments.contains("--windowed") {
-    engine.makeWindowVisibleForDev()
-} else if engine.cfg.sky {
-    Sky.bootstrap()
+engine.makeWindowVisibleForDev()   // windowed and sky both show the window;
+                                   // sky raises it over the lock on mount
+if engine.windowed {
+    engine.sceneView.isPaused = false   // dev view renders continuously
+    (engine.sceneView.layer as? CAMetalLayer)?.isOpaque = false
+    app.activate(ignoringOtherApps: true)
 }
-
-engine.syncDrawableSize()
-let engineDisplayLink = engine.sceneView.displayLink(
-    target: engine, selector: #selector(Engine.tickFrame))
-engineDisplayLink.add(to: .main, forMode: .common)
-engineDisplayLink.isPaused = !(engine.cfg.sky && !CommandLine.arguments.contains("--windowed"))
+if engine.cfg.sky && !engine.windowed { Sky.bootstrap() }
 
 let watcher = LockWatcher { locked in
-    guard engine.cfg.sky, !CommandLine.arguments.contains("--windowed") else {
+    guard engine.cfg.sky, !engine.windowed else {
         say("lock change ignored: mount disabled (--windowed or sky=0)")
         return
     }
@@ -358,6 +391,12 @@ let watcher = LockWatcher { locked in
 }
 watcher.start()
 
-say("ShittimMac ready: room='\(engine.cfg.room)' character='\(engine.cfg.character.isEmpty ? "(none)" : engine.cfg.character)' sky=\(engine.cfg.sky && !CommandLine.arguments.contains("--windowed")) clock=\(engine.cfg.clock)")
+if engine.windowed {
+    app.activate(ignoringOtherApps: true)
+}
+
+say("ShittimMac ready: room='\(engine.cfg.room)' character='\(engine.cfg.character.isEmpty ? "(none)" : engine.cfg.character)' sky=\(engine.cfg.sky && !engine.windowed) clock=\(engine.cfg.clock)")
+
+DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { engine.dumpWindowState() }
 
 app.run()
