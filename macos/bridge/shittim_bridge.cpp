@@ -251,7 +251,12 @@ int sb_render(int width, int height,
 // -------------------------------------------------------------------- pages
 
 int sb_page_count(void) {
-    return int(g_room.loader->pages.size() + g_char.loader->pages.size());
+    // The character slot may never have been loaded (config without a
+    // character): its loader is a null unique_ptr, not an empty vector.
+    int n = int(g_room.loader->pages.size());
+    if (g_hasChar && g_char.loader)
+        n += int(g_char.loader->pages.size());
+    return n;
 }
 
 int sb_page(int index, const uint8_t** outRgba, int* outW, int* outH) {

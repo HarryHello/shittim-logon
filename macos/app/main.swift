@@ -43,7 +43,10 @@ struct Config {
     var sky = true
     var clock = true
     var windowed = false
-    var hole: SIMD4<Float> = SIMD4(0.36, 0.34, 0.28, 0.50) // x, y, w, h fractions
+    var authAlpha: Float = 0.30     // whole-window opacity once the password
+                                    // field is up (auth phase): the system
+                                    // clock/password float over the ghosted
+                                    // scene, like they float over the wallpaper
 
     static func load() -> Config {
         var c = Config()
@@ -65,10 +68,7 @@ struct Config {
                 case "character_anim": c.characterAnim = v
                 case "sky": c.sky = (v == "1" || v == "true")
                 case "clock": c.clock = (v == "1" || v == "true")
-                case "hole_x": c.hole.x = Float(v) ?? c.hole.x
-                case "hole_y": c.hole.y = Float(v) ?? c.hole.y
-                case "hole_w": c.hole.z = Float(v) ?? c.hole.z
-                case "hole_h": c.hole.w = Float(v) ?? c.hole.w
+                case "auth_alpha": c.authAlpha = Float(v) ?? c.authAlpha
                 default: say("config: unknown key '\(k)'")
                 }
             }
@@ -290,8 +290,6 @@ final class Engine: NSObject, MTKViewDelegate {
         let scale = window.backingScaleFactor
         let px = sceneView.bounds.applying(CGAffineTransform(scaleX: scale, y: scale)).size
         sceneView.drawableSize = px
-        renderer.holeRect = cfg.hole * SIMD4<Float>(
-            Float(px.width), Float(px.height), Float(px.width), Float(px.height))
     }
 
     // MARK: mount / unmount
@@ -312,6 +310,7 @@ final class Engine: NSObject, MTKViewDelegate {
             phaseArrived = false
             charAlpha = 0
             sb_set_character_alpha(0)
+            window.alphaValue = 1
             window.orderOut(nil)
             say("unmounted (session unlocked)")
         }
@@ -339,6 +338,15 @@ final class Engine: NSObject, MTKViewDelegate {
         if phaseArrived && hasCharacter && charAlpha < 1.0 {
             charAlpha = min(1.0, charAlpha + dt / 0.8)
             sb_set_character_alpha(charAlpha)
+        }
+
+        // Auth fade: once the password field is up, the scene becomes a
+        // translucent backdrop so the system clock/password float above it --
+        // the same "floating over the background" relationship they have with
+        // the lock wallpaper.
+        let targetAlpha = CGFloat(phaseArrived ? cfg.authAlpha : 1.0)
+        if abs(window.alphaValue - targetAlpha) > 0.01 {
+            window.alphaValue += (targetAlpha - window.alphaValue) * CGFloat(min(1.0, dt * 4.0))
         }
 
         if cfg.clock {
@@ -373,14 +381,17 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 
 let engine = Engine.shared
-engine.makeWindowVisibleForDev()   // windowed and sky both show the window;
-                                   // sky raises it over the lock on mount
 if engine.windowed {
-    engine.sceneView.isPaused = false   // dev view renders continuously
+    engine.makeWindowVisibleForDev()   // dev view: centered, titled, clickable
+    engine.sceneView.isPaused = false  // dev view renders continuously
     (engine.sceneView.layer as? CAMetalLayer)?.isOpaque = false
     app.activate(ignoringOtherApps: true)
+} else if engine.cfg.sky {
+    Sky.bootstrap()                    // sky mode: window is already fullscreen;
+                                       // it mounts over the lock on lock
+} else {
+    say("sky mount disabled (sky=0) -- plain desktop window")
 }
-if engine.cfg.sky && !engine.windowed { Sky.bootstrap() }
 
 let watcher = LockWatcher { locked in
     guard engine.cfg.sky, !engine.windowed else {

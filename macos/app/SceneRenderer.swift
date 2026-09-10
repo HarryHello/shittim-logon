@@ -138,7 +138,7 @@ final class SceneRenderer {
     func makeTextTexture(text: String, fontSize: CGFloat) -> MTLTexture? {
         let W = 720, H = 200
         let img = NSImage(size: NSSize(width: W, height: H))
-        img.lockFocusFlipped(true)
+        img.lockFocus()
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .light),
             .foregroundColor: NSColor.white,
@@ -254,10 +254,10 @@ final class SceneRenderer {
             let cw = Float(clockRect.width), ch = Float(clockRect.height)
             let x0 = Float(clockRect.minX), y0 = Float(clockRect.minY)
             let quad: [QuadVert] = [
-                QuadVert(x: x0,      y: y0,      u: 0, v: 1, r: 255, g: 255, b: 255, a: 255),
-                QuadVert(x: x0 + cw, y: y0,      u: 1, v: 1, r: 255, g: 255, b: 255, a: 255),
-                QuadVert(x: x0,      y: y0 + ch, u: 0, v: 0, r: 255, g: 255, b: 255, a: 255),
-                QuadVert(x: x0 + cw, y: y0 + ch, u: 1, v: 0, r: 255, g: 255, b: 255, a: 255),
+                QuadVert(x: x0,      y: y0,      u: 0, v: 0, r: 255, g: 255, b: 255, a: 255),
+                QuadVert(x: x0 + cw, y: y0,      u: 1, v: 0, r: 255, g: 255, b: 255, a: 255),
+                QuadVert(x: x0,      y: y0 + ch, u: 0, v: 1, r: 255, g: 255, b: 255, a: 255),
+                QuadVert(x: x0 + cw, y: y0 + ch, u: 1, v: 1, r: 255, g: 255, b: 255, a: 255),
             ]
             enc.setVertexBytes(quad, length: 4 * 20, index: 0)
             // the quad uses the same vertex layout (pos, uv, color, stride 20)
