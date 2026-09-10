@@ -1,0 +1,30 @@
+# shittim-mac.conf -- ShittimMac 的旋钮。放在运行目录下即可。
+# 全部键都有默认值;不认识的键会被记进日志。
+
+# 资产目录(包含 .skel/.atlas/.png)
+assets=../assets
+
+# 房间骨架(自包含:教室 + 坐姿角色 + 道具)
+room=arona_workpage_nighttime_2
+
+# 房间轨道:坐姿角色 Idle_NN;同伴 Idle_NN(0 = 无同伴)
+idle=1
+companion=11
+
+# 前景角色骨架(B 阶段)。留空 = B 阶段停留在 A。
+character=arona_spr
+# 前景角色的动画名。留空 = 骨架里第一个含 Idle 的动画。
+character_anim=
+
+# 锁屏挂载开关(1 = 锁屏时全屏挂到原始锁屏之上)
+sky=1
+
+# 场景内时钟(24 小时制)
+clock=1
+
+# 密码框镂空区域(屏幕比例:x, y, w, h)——该区域内场景透明,
+# 系统密码框从下面透出来。按自己的锁屏实测调。
+hole_x=0.36
+hole_y=0.34
+hole_w=0.28
+hole_h=0.50

@@ -25,3 +25,10 @@ obj/
 .vscode/
 Thumbs.db
 desktop.ini
+
+# macOS target: build products and the vendored spine-cpp runtime (see
+# macos/spine/README.md and NOTICE.md -- the runtime is third-party and
+# licensed separately; it is never distributed from this repository).
+macos/build/
+macos/spine/include/
+macos/spine/src/
