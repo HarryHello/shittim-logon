@@ -9,8 +9,11 @@
 // alpha masters; getting this wrong shows up as dark fringes on every
 // semi-transparent edge.
 //
-// The context is drawn with a vertical flip because CGContextDrawImage works
-// bottom-up while sl::Image is row-major top-down (matching WIC's CopyPixels).
+// Row order: CGContextDrawImage into a plain (unflipped) bitmap context
+// produces top-down rows, matching WIC's CopyPixels and the atlas UV
+// convention. Measured, not assumed: the "everyone knows CG draws upside
+// down, add a flip" folklore produced an atlas mirrored end to end, and with
+// region-packed atlases that scrambles every mesh on screen.
 
 #pragma once
 
@@ -78,8 +81,6 @@ inline Image loadPng(const std::string& path) {
         throw std::runtime_error("could not create bitmap context for " + path);
     }
     CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
-    CGContextTranslateCTM(ctx, 0, CGFloat(h));
-    CGContextScaleCTM(ctx, 1.0, -1.0);          // bottom-up draw -> top-down rows
     CGContextDrawImage(ctx, CGRectMake(0, 0, CGFloat(w), CGFloat(h)), img);
     CGContextRelease(ctx);
     CGImageRelease(img);
