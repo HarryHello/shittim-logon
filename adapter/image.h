@@ -14,6 +14,11 @@
 
 #pragma once
 
+// Platform split: the WIC backend below is Windows-only. On other platforms
+// image_mac.h provides the same sl::Image / loadPng / savePng API over
+// ImageIO, with the same straight-alpha RGBA8 contract.
+#if defined(_WIN32)
+
 // NOMINMAX before windows.h, always. Without it windows.h defines min and max as
 // function-like macros, and every std::min / std::max further down the include
 // graph fails with C4002 and a cascade of syntax errors that point at the *user*
@@ -179,3 +184,7 @@ inline void savePng(const Image& img, const std::string& path) {
 }
 
 } // namespace sl
+
+#else
+#include "image_mac.h"
+#endif
