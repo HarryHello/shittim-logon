@@ -32,3 +32,4 @@ desktop.ini
 macos/build/
 macos/spine/include/
 macos/spine/src/
+.DS_Store
