@@ -43,10 +43,9 @@ struct Config {
     var sky = true
     var clock = true
     var windowed = false
-    var authAlpha: Float = 0.30     // whole-window opacity once the password
-                                    // field is up (auth phase): the system
-                                    // clock/password float over the ghosted
-                                    // scene, like they float over the wallpaper
+    var skyLevel: Int = 350         // SkyLight space level for the overlay:
+                                    // measured band: 300 and below are covered
+                                    // by the lock screen, 320+ float above it
 
     static func load() -> Config {
         var c = Config()
@@ -68,7 +67,7 @@ struct Config {
                 case "character_anim": c.characterAnim = v
                 case "sky": c.sky = (v == "1" || v == "true")
                 case "clock": c.clock = (v == "1" || v == "true")
-                case "auth_alpha": c.authAlpha = Float(v) ?? c.authAlpha
+                case "sky_level": c.skyLevel = Int(v) ?? c.skyLevel
                 default: say("config: unknown key '\(k)'")
                 }
             }
@@ -258,6 +257,11 @@ final class Engine: NSObject, MTKViewDelegate {
         window.collectionBehavior = [.fullScreenAuxiliary, .stationary,
                                      .canJoinAllSpaces, .ignoresCycle]
         window.canBecomeVisibleWithoutLogin = true
+        if !windowed {
+            // The measured band: 300 and below are covered by the lock
+            // screen; 320+ float above it. 350 sits mid-band with margin.
+            window.level = NSWindow.Level(rawValue: cfg.skyLevel)
+        }
 
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"   // 24-hour: the scene's own convention
@@ -338,15 +342,6 @@ final class Engine: NSObject, MTKViewDelegate {
         if phaseArrived && hasCharacter && charAlpha < 1.0 {
             charAlpha = min(1.0, charAlpha + dt / 0.8)
             sb_set_character_alpha(charAlpha)
-        }
-
-        // Auth fade: once the password field is up, the scene becomes a
-        // translucent backdrop so the system clock/password float above it --
-        // the same "floating over the background" relationship they have with
-        // the lock wallpaper.
-        let targetAlpha = CGFloat(phaseArrived ? cfg.authAlpha : 1.0)
-        if abs(window.alphaValue - targetAlpha) > 0.01 {
-            window.alphaValue += (targetAlpha - window.alphaValue) * CGFloat(min(1.0, dt * 4.0))
         }
 
         if cfg.clock {

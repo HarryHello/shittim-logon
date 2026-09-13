@@ -187,8 +187,24 @@ int sb_render(int width, int height,
     // single pass when the canvas is ours). The foreground character renders
     // above it through its own camera.
     auto emit = [&](SbSlot& s, const scene::Viewport& vp, float alpha) {
+        // Overlay mode (g_roomCharOnly): the room skeleton renders its
+        // CHARACTER slots only -- the static room backdrop comes from the
+        // wallpaper beneath, so nothing here can cover the system clock or
+        // password field.
+        scene::Classification cls = scene::classify(*s.skeleton);
+        std::vector<std::pair<spine::Slot*, float>> passSaved;
         for (spine::RenderCommand* cmd = s.renderer->render(*s.skeleton); cmd; cmd = cmd->next) {
             if (!cmd->texture || !cmd->numVertices) continue;
+            if (&s == &g_room) {
+                for (size_t i = 0; i < s.skeleton->getSlots().size(); ++i) {
+                    if (scene::hiddenInPass(cls, i, scene::Pass::CharOnly)) {
+                        spine::Slot* slot = s.skeleton->getSlots()[i];
+                        passSaved.push_back({slot, slot->getColor().a});
+                        slot->getColor().a = 0;
+                    }
+                }
+            }
+
             const int pageOf = [&] {
                 int i = 0;
                 for (const auto& p : g_room.loader->pages) {
@@ -233,6 +249,7 @@ int sb_render(int width, int height,
                 g_indices.push_back(unsigned(cmd->indices[i]) + unsigned(batch.vertexOffset));
             g_batches.push_back(batch);
         }
+        for (auto& e : passSaved) e.first->getColor().a = e.second;
     };
 
     emit(g_room, scene::roomViewport(width, height), 1.0f);
