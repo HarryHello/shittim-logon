@@ -26,4 +26,4 @@ sky_level=350
 # 房间背景板的静音名单:路径含这些子串的槽位不渲染
 # (逗号分隔)。默认隐藏地板和水光;系统时钟在顶部,
 # 若被场景上半部盖住,把 sky,starsource 加进来。
-mute_patterns=floor,waterlight
+mute_patterns=floor,waterlight,bg_sky,starsource,bg/sea,sea

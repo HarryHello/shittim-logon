@@ -44,7 +44,7 @@ struct Config {
     var clock = true
     var windowed = false
     var skyLevel: Int = 350
-    var mutePatterns = "floor,waterlight"   // room pieces hidden in the overlay         // SkyLight space level for the overlay:
+    var mutePatterns = "floor,waterlight,bg_sky,starsource,bg/sea,sea"   // room pieces hidden in the overlay         // SkyLight space level for the overlay:
                                     // measured band: 300 and below are covered
                                     // by the lock screen, 320+ float above it
 

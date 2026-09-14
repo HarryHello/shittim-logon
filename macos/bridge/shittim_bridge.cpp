@@ -83,7 +83,7 @@ ProtectRects g_protect;
 // Room backdrop pieces whose (lowercased) path contains any of these
 // substrings are muted: the floor and its water-light effect. The walls,
 // windows, sea and sky render.
-static std::vector<std::string> g_mutePatterns = {"floor", "waterlight"};
+static std::vector<std::string> g_mutePatterns = {"floor", "waterlight", "bg_sky", "starsource", "bg/sea", "sea"};
 
 static std::string lowerAscii(std::string s) {
     for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
