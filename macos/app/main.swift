@@ -43,7 +43,8 @@ struct Config {
     var sky = true
     var clock = true
     var windowed = false
-    var skyLevel: Int = 350         // SkyLight space level for the overlay:
+    var skyLevel: Int = 350
+    var mutePatterns = "floor,waterlight"   // room pieces hidden in the overlay         // SkyLight space level for the overlay:
                                     // measured band: 300 and below are covered
                                     // by the lock screen, 320+ float above it
 
@@ -68,6 +69,7 @@ struct Config {
                 case "sky": c.sky = (v == "1" || v == "true")
                 case "clock": c.clock = (v == "1" || v == "true")
                 case "sky_level": c.skyLevel = Int(v) ?? c.skyLevel
+                case "mute_patterns": c.mutePatterns = v
                 default: say("config: unknown key '\(k)'")
                 }
             }
@@ -159,6 +161,10 @@ final class SceneView: MTKView {
         clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         framebufferOnly = true
         autoResizeDrawable = true
+        // CAMetalLayer defaults to opaque compositing; without this the
+        // transparent regions render as pure black over the lock screen.
+        layer?.isOpaque = false
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
     required init(coder: NSCoder) { fatalError("not supported") }
@@ -204,6 +210,7 @@ final class Engine: NSObject, MTKViewDelegate {
         guard sb_load_room(cfg.assets, cfg.room) == 0 else {
             fatalError("could not load room '\(cfg.room)' from '\(cfg.assets)'")
         }
+        sb_set_mute_patterns(cfg.mutePatterns)
         sb_room_play(0, "Idle_background_00", 1)
         let idleName = String(format: "Idle_%02d", cfg.idle)
         if sb_room_play(1, idleName, 1) != 0 { say("room: no '\(idleName)' -- skipped") }

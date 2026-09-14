@@ -11,10 +11,11 @@
 
 #include "shittim_bridge.h"
 
-#include "../../adapter/image.h"
-#include "../../adapter/raster.h"
-#include "../../adapter/scene.h"
-#include "../../adapter/scenes.h"
+#include "image.h"
+#include "raster.h"
+#include "scene.h"
+#include "scenes.h"
+#include "scene.h"
 
 #include <spine/spine.h>
 #include <spine/SkeletonRenderer.h>
@@ -65,6 +66,37 @@ scene::Viewport g_charViewport;
 bool g_charViewportValid = false;
 
 std::vector<SBBatchVertex> g_vertices;
+
+// Protect rects (fractions of the screen): anything whose screen
+// bounds intersect them is muted for the frame so the system clock
+// and password field read through unoccluded. The room backdrop
+// spans the screen and is muted by the same rule -- "the classroom
+// background is abandoned, the desks/chairs/characters float" is
+// this rule plus nothing else.
+struct ProtectRects {
+    bool enabled = false;
+    float clock[4] = {0.24f, 0.04f, 0.52f, 0.22f};
+    float pwd[4]   = {0.32f, 0.40f, 0.36f, 0.18f};
+};
+ProtectRects g_protect;
+
+// Room backdrop pieces whose (lowercased) path contains any of these
+// substrings are muted: the floor and its water-light effect. The walls,
+// windows, sea and sky render.
+static std::vector<std::string> g_mutePatterns = {"floor", "waterlight"};
+
+static std::string lowerAscii(std::string s) {
+    for (auto& ch : s) ch = (char)std::tolower((unsigned char)ch);
+    return s;
+}
+static bool pathMuted(const std::string& path) {
+    const std::string low = lowerAscii(path);
+    for (const auto& p : g_mutePatterns)
+        if (low.find(p) != std::string::npos) return true;
+    return false;
+}
+bool g_roomCharOnly = true;   // room renders its character slots only; the
+                              // static room comes from the wallpaper still
 std::vector<unsigned short> g_indices;
 std::vector<SBBatch> g_batches;
 
@@ -186,25 +218,71 @@ int sb_render(int width, int height,
     // background is underneath everything and occlusion is natural in a
     // single pass when the canvas is ours). The foreground character renders
     // above it through its own camera.
+    // Mute slots whose screen bounds intersect a protect rect (the
+    // system clock and password field): they render beneath our
+    // scene, so muting keeps them readable. Restored right after emit.
+    std::vector<std::pair<spine::Slot*, float>> savedAlphas;
+    auto muteProtected = [&](const scene::Viewport& vp, spine::Skeleton& sk) {
+        if (!g_protect.enabled) return;
+        const float sx = float(width) / vp.width;
+        const float sy = float(height) / vp.height;
+        const float top = vp.bottom + vp.height;
+        spine::Vector<float> wv;
+        for (size_t si = 0; si < sk.getSlots().size(); ++si) {
+            spine::Slot* slot = sk.getSlots()[si];
+            spine::Attachment* att = slot->getAttachment();
+            if (!att) continue;
+            int n = 0;
+            if (auto* r = dynamic_cast<spine::RegionAttachment*>(att)) {
+                wv.setSize(8, 0); r->computeWorldVertices(*slot, wv, 0, 2); n = 4;
+            } else if (auto* m = dynamic_cast<spine::MeshAttachment*>(att)) {
+                n = (int)m->getWorldVerticesLength() / 2;
+                wv.setSize(n * 2, 0); m->computeWorldVertices(*slot, 0, n * 2, wv, 0, 2);
+            } else continue;
+            float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+            for (int k = 0; k < n; ++k) {
+                const float px = (wv[k * 2] - vp.left) * sx;
+                const float py = (top - wv[k * 2 + 1]) * sy;
+                minX = std::min(minX, px); maxX = std::max(maxX, px);
+                minY = std::min(minY, py); maxY = std::max(maxY, py);
+            }
+            const auto path = lowerAscii(scene::attachmentPath(att));
+            if (pathMuted(path)) {
+                savedAlphas.push_back({slot, slot->getColor().a});
+                slot->getColor().a = 0;
+            }
+        }
+    };
+    auto restoreMuted = [&]() {
+        for (auto& e : savedAlphas) e.first->getColor().a = e.second;
+        savedAlphas.clear();
+    };
     auto emit = [&](SbSlot& s, const scene::Viewport& vp, float alpha) {
-        // Overlay mode (g_roomCharOnly): the room skeleton renders its
-        // CHARACTER slots only -- the static room backdrop comes from the
-        // wallpaper beneath, so nothing here can cover the system clock or
-        // password field.
+        muteProtected(vp, *s.skeleton);
+
+        // Room pass: characters only. The static room comes from the wallpaper
+        // still, so the live layer must not re-draw walls/desks over the
+        // system clock/password.
         scene::Classification cls = scene::classify(*s.skeleton);
         std::vector<std::pair<spine::Slot*, float>> passSaved;
+        if (&s == &g_room && g_roomCharOnly) {
+            for (size_t i = 0; i < s.skeleton->getSlots().size(); ++i) {
+                // Keep characters and stage dressing (desks/chairs/shadows/
+                // lights -- the furniture the scene is "made of"); mute only
+                // the big backdrop pieces (walls/windows/sea), which would
+                // otherwise cover the system clock and password field.
+                spine::Slot* slot = s.skeleton->getSlots()[i];
+                const bool isChar = !scene::hiddenInPass(cls, i, scene::Pass::CharOnly);
+                const bool dressing = scene::isStageDressing(
+                    scene::attachmentPath(slot->getAttachment()));
+                if (isChar || dressing) continue;
+                passSaved.push_back({slot, slot->getColor().a});
+                slot->getColor().a = 0;
+            }
+        }
+
         for (spine::RenderCommand* cmd = s.renderer->render(*s.skeleton); cmd; cmd = cmd->next) {
             if (!cmd->texture || !cmd->numVertices) continue;
-            if (&s == &g_room) {
-                for (size_t i = 0; i < s.skeleton->getSlots().size(); ++i) {
-                    if (scene::hiddenInPass(cls, i, scene::Pass::CharOnly)) {
-                        spine::Slot* slot = s.skeleton->getSlots()[i];
-                        passSaved.push_back({slot, slot->getColor().a});
-                        slot->getColor().a = 0;
-                    }
-                }
-            }
-
             const int pageOf = [&] {
                 int i = 0;
                 for (const auto& p : g_room.loader->pages) {
@@ -290,6 +368,31 @@ int sb_page(int index, const uint8_t** outRgba, int* outW, int* outH) {
     return 0;
 }
 
+void sb_set_protect_rects(float clockX, float clockY, float clockW, float clockH,
+                          float pwdX, float pwdY, float pwdW, float pwdH) {
+    g_protect.enabled = true;
+    g_protect.clock[0] = clockX; g_protect.clock[1] = clockY;
+    g_protect.clock[2] = clockW; g_protect.clock[3] = clockH;
+    g_protect.pwd[0] = pwdX; g_protect.pwd[1] = pwdY;
+    g_protect.pwd[2] = pwdW; g_protect.pwd[3] = pwdH;
+}
+
+void sb_set_mute_patterns(const char* csv) {
+    g_mutePatterns.clear();
+    if (!csv) return;
+    std::string item;
+    for (const char* p = csv; ; ++p) {
+        if (*p == ',' || *p == 0) {
+            if (!item.empty()) g_mutePatterns.push_back(lowerAscii(item));
+            item.clear();
+            if (*p == 0) break;
+        } else item.push_back(*p);
+    }
+}
+
+void sb_set_room_char_only(int enabled) {
+    g_roomCharOnly = enabled != 0;
+}
 void sb_shutdown(void) {
     g_char = SbSlot();
     g_room = SbSlot();

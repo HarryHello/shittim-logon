@@ -73,6 +73,17 @@ int sb_render(int width, int height,
 int sb_page_count(void);
 int sb_page(int index, const uint8_t** outRgba, int* outW, int* outH);
 
+// Protect rects (fractions of the screen): scene elements whose screen
+// bounds intersect a protect rect are muted (alpha 0) for the frame, so the
+// system clock and password field read through unoccluded. The classroom
+// backdrop spans the whole screen and is muted by the same rule.
+void sb_set_protect_rects(float clockX, float clockY, float clockW, float clockH,
+                          float pwdX, float pwdY, float pwdW, float pwdH);
+
+void sb_set_room_char_only(int enabled);
+
+void sb_set_mute_patterns(const char* csv);
+
 void sb_shutdown(void);
 
 #ifdef __cplusplus
