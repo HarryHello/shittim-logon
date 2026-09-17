@@ -33,3 +33,8 @@ macos/build/
 macos/spine/include/
 macos/spine/src/
 .DS_Store
+
+# The upstream Windows source drop (1.3.0), kept locally as a reference while
+# the mechanism is synced into adapter/. The real scene table and the extracted
+# game assets live under it -- same policy as assets/: never committed.
+shittim-logon-*-src/

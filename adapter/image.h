@@ -19,6 +19,8 @@
 // ImageIO, with the same straight-alpha RGBA8 contract.
 #if defined(_WIN32)
 
+#include "pathio.h"   // 1.3.0: the shared UTF-8 <-> wide helpers, and Utf8Args for argv
+
 // NOMINMAX before windows.h, always. Without it windows.h defines min and max as
 // function-like macros, and every std::min / std::max further down the include
 // graph fails with C4002 and a cascade of syntax errors that point at the *user*
@@ -78,11 +80,7 @@ inline IWICImagingFactory* factory() {
 }
 
 inline std::wstring widen(const std::string& s) {
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
-    return w;
+    return widenUtf8(s);   // 1.3.0: one implementation, in pathio.h
 }
 
 template <class T> struct Released {

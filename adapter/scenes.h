@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include "subtitle.h"   // 1.3.0: Style/Rgba/Language live there now
+
 #include <algorithm>
 #include <cmath>
 #include <cctype>
@@ -68,6 +70,52 @@ struct Entry {
     std::string name;
     bool        active = false;
 };
+
+// ------------------------------------------------------------------ 1.3.0 constants
+//
+// The character's supersampling: 2x render-down for crispness, 1x above the
+// height where the cost stops being worth it (auto), forced either way.
+enum class CharacterAA {
+    Auto,
+    Off,
+    On,
+};
+
+inline constexpr int kAutoAaOffHeight = 2000;
+
+inline int AutoCharacterSuper(int screenHeightPx) {
+    return screenHeightPx >= kAutoAaOffHeight ? 1 : 2;
+}
+
+inline int CharacterSuper(CharacterAA aa, int screenHeightPx) {
+    if (aa == CharacterAA::Off) return 1;
+    if (aa == CharacterAA::On)  return 2;
+    return AutoCharacterSuper(screenHeightPx);
+}
+
+// Clock/character offsets are fractions of the screen; clamped so a typo of 50
+// cannot push them off-screen.
+inline constexpr float kClockOffsetLimit = 0.5f;
+inline constexpr float kCharacterOffsetLimit = 0.25f;
+
+// Voice: how long the room stays quiet before an idle line may play.
+inline constexpr int kVoiceIdleIntervalDefault = 30;
+inline constexpr int kVoiceIdleIntervalMin     = 15;
+inline constexpr int kVoiceIdleIntervalMax     = 10000;
+
+// BGM: which track, and the two volumes around it.
+inline constexpr const char *kBgmTrackFactory = "factory";
+inline constexpr const char *kBgmTrackCustom  = "custom";
+inline constexpr size_t kBgmTrackMaxLen = 32;
+
+inline bool BgmTrackIsCustom(const std::string &id) { return id == kBgmTrackCustom; }
+
+inline constexpr int kBgmVolumeDefault = 40;
+inline constexpr int kBgmDuckDefault   = 35;
+
+// Real-time cap. 0 means uncapped.
+inline constexpr int kFrameRateLimitMin =  24;
+inline constexpr int kFrameRateLimitMax = 480;
 
 // ------------------------------------------------------------------ settings
 //
@@ -119,8 +167,9 @@ struct Settings {
     // Set it to false to follow Windows' own time format and language. See
     // localeclock.h.
     bool  force24Hour = true;
-    // Added to the clock's vertical position, as a fraction of screen height.
-    // Negative moves it up. Resolution-independent, so it survives a monitor change.
+    // Added to the clock's position, as a fraction of screen size. Negative
+    // moves it up/left. Resolution-independent, so it survives a monitor change.
+    float clockOffsetX = 0.0f;
     float clockOffsetY = 0.0f;
     // Opt in to work that has never run on hardware this project owns: Windows
     // Hello coexistence and Surface-shaped screens. Off by default because the
@@ -180,6 +229,42 @@ struct Settings {
     // region is deliberate: what somebody gives up is the full-screen effect, and that
     // is the sentence they should be reading when they decide.
     bool  fullscreenFx = true;
+    // --- 1.3.0 settings ---
+
+    // After unlocking, sign back into the last account automatically.
+    bool  restartAutoSignIn = false;
+    // Pat the character on the head and she reacts.
+    bool  headpat = true;
+    // Don't fade the account tiles during the unlock handover.
+    bool  disableAccountFade = false;
+    // Draw the dismiss (arrow) button on the credential screen.
+    bool  dismissButton = false;
+    // Which monitor the logon scene covers, when there is more than one.
+    std::string logonMonitor = "primary";
+    // The foreground character's supersampling; see CharacterSuper.
+    CharacterAA characterAA = CharacterAA::Auto;
+    // The foreground character's position, as a fraction of screen size.
+    float characterOffsetX = 0.0f;
+    float characterOffsetY = 0.0f;
+    // Idle voicelines, with the subtitle panel that accompanies them.
+    bool voice = false;
+    int  voiceVolume = 50;
+    std::string voiceDevice;          // empty = the system default
+    bool voiceDeviceFallback = false;
+    bool voiceSubtitle = true;
+    bool voiceSubtitleScene = true;
+    bool voiceSubtitleCharacter = true;
+    subtitle::Style voiceSubtitleStyle;
+    subtitle::Language voiceSubtitleLanguage = subtitle::Language::Chinese;
+    int  voiceIdleInterval = kVoiceIdleIntervalDefault;
+    // Background music: which track, how loud, and how far to duck it while a
+    // voice line plays.
+    bool bgm = false;
+    int  bgmVolume = kBgmVolumeDefault;
+    std::string bgmTrack = kBgmTrackFactory;
+    int  bgmDuck = kBgmDuckDefault;
+    // Real-time cap; 0 = uncapped.
+    int  frameRateLimit = 0;
 };
 
 // Case-insensitive, so `False` and `FALSE` behave. Anything that is not a
@@ -194,6 +279,143 @@ inline bool ParseBool(const std::string &v, bool fallback, bool *understood = nu
     if (s == "false" || s == "0" || s == "no" || s == "off") return false;
     if (understood) *understood = false;
     return fallback;
+}
+
+// --- 1.3.0 parsers ---
+
+inline CharacterAA ParseCharacterAA(const std::string &v, CharacterAA fallback,
+                                    bool *understood = nullptr) {
+    std::string s;
+    for (char c : v) s.push_back((char)std::tolower((unsigned char)c));
+    if (understood) *understood = true;
+    if (s == "auto") return CharacterAA::Auto;
+    if (s == "on"  || s == "true"  || s == "yes" || s == "2") return CharacterAA::On;
+    if (s == "off" || s == "false" || s == "no"  || s == "1" || s == "0")
+        return CharacterAA::Off;
+    if (understood) *understood = false;
+    return fallback;
+}
+
+inline std::string ParseBgmTrack(const std::string &v, const std::string &fallback,
+                                 bool *understood = nullptr) {
+    std::string s;
+    for (char c : v) s.push_back((char)std::tolower((unsigned char)c));
+    if (understood) *understood = true;
+    if (s == "vendor" || s == "default") return kBgmTrackFactory;
+    if (s == "own" || s == "user") return kBgmTrackCustom;
+    if (!s.empty() && s.size() <= kBgmTrackMaxLen) {
+        bool clean = true;
+        for (char c : s)
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.'))
+                clean = false;
+        if (clean && s != "." && s != "..") return s;
+    }
+    if (understood) *understood = false;
+    return fallback;
+}
+
+// strtof rather than atof: atof cannot report that it read nothing, so
+// `clock_offset_y=up` would silently become 0 and look like it worked.
+inline float ParseFrac(const std::string &v, float limit, float fallback,
+                       bool *understood = nullptr) {
+    const char *b = v.c_str();
+    char *end = nullptr;
+    const float f = std::strtof(b, &end);
+    if (end == b || *end != '\0' || f != f) {
+        if (understood) *understood = false;
+        return fallback;
+    }
+    if (understood) *understood = true;
+    return f < -limit ? -limit : (f > limit ? limit : f);
+}
+
+// `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa` -- into a subtitle colour.
+inline subtitle::Rgba ParseColor(const std::string &v, subtitle::Rgba fallback,
+                                 bool *understood = nullptr) {
+    std::string h;
+    for (char c : v) {
+        if (c == '#' && h.empty()) continue;
+        h.push_back((char)std::tolower((unsigned char)c));
+    }
+    const size_t n = h.size();
+    if (n != 3 && n != 4 && n != 6 && n != 8) {
+        if (understood) *understood = false;
+        return fallback;
+    }
+    int nib[8] = { 0 };
+    for (size_t i = 0; i < n; i++) {
+        const char c = h[i];
+        if (c >= '0' && c <= '9')      nib[i] = c - '0';
+        else if (c >= 'a' && c <= 'f') nib[i] = 10 + (c - 'a');
+        else {
+            if (understood) *understood = false;
+            return fallback;
+        }
+    }
+    int comp[4] = { 0, 0, 0, 255 };
+    if (n <= 4) {
+        for (size_t i = 0; i < n; i++) comp[i] = nib[i] * 17;
+    } else {
+        for (size_t i = 0; i < n / 2; i++) comp[i] = nib[i * 2] * 16 + nib[i * 2 + 1];
+    }
+    if (understood) *understood = true;
+    subtitle::Rgba out;
+    out.r = (float)comp[0] / 255.0f;
+    out.g = (float)comp[1] / 255.0f;
+    out.b = (float)comp[2] / 255.0f;
+    out.a = (float)comp[3] / 255.0f;
+    return out;
+}
+
+inline float ParseScale(const std::string &v, float lo, float hi, float fallback,
+                        bool *understood = nullptr) {
+    const char *b = v.c_str();
+    char *end = nullptr;
+    const float f = std::strtof(b, &end);
+    if (end == b || *end != '\0' || f != f) {
+        if (understood) *understood = false;
+        return fallback;
+    }
+    if (understood) *understood = true;
+    return f < lo ? lo : (f > hi ? hi : f);
+}
+
+inline subtitle::Language ParseLanguage(const std::string &v, subtitle::Language fallback,
+                                        bool *understood = nullptr) {
+    std::string s;
+    for (char c : v) s.push_back((char)std::tolower((unsigned char)c));
+    if (understood) *understood = true;
+    if (s.empty() || s == "zh" || s == "zh-cn" || s == "cn" || s == "chinese" ||
+        s == "\xe4\xb8\xad\xe6\x96\x87")
+        return subtitle::Language::Chinese;
+    if (s == "ja" || s == "ja-jp" || s == "jp" || s == "japanese" ||
+        s == "\xe6\x97\xa5\xe6\x96\x87" ||
+        s == "\xe6\x97\xa5\xe8\xaf\xad" ||
+        s == "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e")
+        return subtitle::Language::Japanese;
+    if (understood) *understood = false;
+    return fallback;
+}
+
+inline int ParseCount(const std::string &v, int lo, int hi, int fallback,
+                      bool *understood = nullptr) {
+    const char *b = v.c_str();
+    char *end = nullptr;
+    const long n = std::strtol(b, &end, 10);
+    if (end == b || *end != '\0') {
+        if (understood) *understood = false;
+        return fallback;
+    }
+    if (understood) *understood = true;
+    return n < lo ? lo : (n > hi ? hi : (int)n);
+}
+
+inline int ParseFrameRateLimit(const std::string &v, int fallback,
+                               bool *understood = nullptr) {
+    const int n = ParseCount(v, 0, kFrameRateLimitMax, fallback, understood);
+    if (n <= 0) return 0;
+    return n < kFrameRateLimitMin ? kFrameRateLimitMin : n;
 }
 
 // Trims ASCII space and tab from both ends. Not locale-aware on purpose: these are
@@ -232,19 +454,78 @@ inline Settings ParseSettings(const std::string &text,
         else if (key == "follow_time_of_day") s.followTimeOfDay = ParseBool(val, s.followTimeOfDay, &ok);
         else if (key == "no_lock_screen")  s.noLockScreen     = ParseBool(val, s.noLockScreen, &ok);
         else if (key == "logon_blur")      s.logonBlur        = ParseBool(val, s.logonBlur, &ok);
+        else if (key == "restart_auto_sign_in")
+            s.restartAutoSignIn = ParseBool(val, s.restartAutoSignIn, &ok);
         else if (key == "fullscreen_fx")   s.fullscreenFx     = ParseBool(val, s.fullscreenFx, &ok);
-        else if (key == "clock_offset_y") {
-            // strtof rather than atof: atof cannot report that it read nothing, so
-            // `clock_offset_y=up` would silently become 0 and look like it worked.
-            const char *b = val.c_str();
-            char *end = nullptr;
-            const float f = std::strtof(b, &end);
-            if (end == b || *end != '\0') ok = false;
-            // Clamped: this is a fraction of screen height, and a typo of 50 instead
-            // of 0.50 would put the clock off the screen with no way to tell that
-            // from the overlay having failed to draw.
-            else s.clockOffsetY = f < -0.5f ? -0.5f : (f > 0.5f ? 0.5f : f);
-        } else {
+        else if (key == "headpat")         s.headpat          = ParseBool(val, s.headpat, &ok);
+        else if (key == "disable_account_fade")
+            s.disableAccountFade = ParseBool(val, s.disableAccountFade, &ok);
+        else if (key == "dismiss_button")
+            s.dismissButton = ParseBool(val, s.dismissButton, &ok);
+
+        else if (key == "account_switch")  continue;   // legacy key, accepted and ignored
+
+        else if (key == "logon_monitor")   s.logonMonitor = val.empty() ? "primary" : val;
+        else if (key == "clock_offset_x")
+            s.clockOffsetX = ParseFrac(val, kClockOffsetLimit, s.clockOffsetX, &ok);
+        else if (key == "clock_offset_y")
+            s.clockOffsetY = ParseFrac(val, kClockOffsetLimit, s.clockOffsetY, &ok);
+
+        else if (key == "character_antialias")
+            s.characterAA = ParseCharacterAA(val, s.characterAA, &ok);
+        else if (key == "character_offset_x")
+            s.characterOffsetX = ParseFrac(val, kCharacterOffsetLimit, s.characterOffsetX, &ok);
+        else if (key == "character_offset_y")
+            s.characterOffsetY = ParseFrac(val, kCharacterOffsetLimit, s.characterOffsetY, &ok);
+
+        else if (key == "voice")          s.voice         = ParseBool(val, s.voice, &ok);
+        else if (key == "voice_subtitle") s.voiceSubtitle = ParseBool(val, s.voiceSubtitle, &ok);
+        else if (key == "voice_subtitle_scene")
+            s.voiceSubtitleScene = ParseBool(val, s.voiceSubtitleScene, &ok);
+        else if (key == "voice_subtitle_character")
+            s.voiceSubtitleCharacter = ParseBool(val, s.voiceSubtitleCharacter, &ok);
+
+        else if (key == "voice_subtitle_background")
+            s.voiceSubtitleStyle.background = ParseColor(val, s.voiceSubtitleStyle.background, &ok);
+        else if (key == "voice_subtitle_border")
+            s.voiceSubtitleStyle.border = ParseColor(val, s.voiceSubtitleStyle.border, &ok);
+        else if (key == "voice_subtitle_text")
+            s.voiceSubtitleStyle.text = ParseColor(val, s.voiceSubtitleStyle.text, &ok);
+        else if (key == "voice_subtitle_border_width")
+            s.voiceSubtitleStyle.borderWidth =
+                (float)ParseCount(val, 0, 4, (int)s.voiceSubtitleStyle.borderWidth, &ok);
+
+        else if (key == "voice_subtitle_font") s.voiceSubtitleStyle.font = val;
+        else if (key == "voice_subtitle_corner")
+            s.voiceSubtitleStyle.corner =
+                (float)ParseCount(val, 0, 16, (int)s.voiceSubtitleStyle.corner, &ok);
+
+        else if (key == "voice_subtitle_scale")
+            s.voiceSubtitleStyle.scale = ParseScale(val, subtitle::kScaleMin, subtitle::kScaleMax,
+                                                    s.voiceSubtitleStyle.scale, &ok);
+
+        else if (key == "voice_subtitle_language")
+            s.voiceSubtitleLanguage = ParseLanguage(val, s.voiceSubtitleLanguage, &ok);
+        else if (key == "voice_volume")
+            s.voiceVolume = ParseCount(val, 0, 100, s.voiceVolume, &ok);
+
+        else if (key == "voice_device")
+            s.voiceDevice = (val == "auto") ? std::string() : val;
+        else if (key == "voice_device_fallback")
+            s.voiceDeviceFallback = ParseBool(val, s.voiceDeviceFallback, &ok);
+        else if (key == "voice_idle_interval")
+            s.voiceIdleInterval = ParseCount(val, kVoiceIdleIntervalMin, kVoiceIdleIntervalMax,
+                                             s.voiceIdleInterval, &ok);
+        else if (key == "bgm") s.bgm = ParseBool(val, s.bgm, &ok);
+        else if (key == "bgm_volume")
+            s.bgmVolume = ParseCount(val, 0, 100, s.bgmVolume, &ok);
+        else if (key == "bgm_track")
+            s.bgmTrack = ParseBgmTrack(val, s.bgmTrack, &ok);
+        else if (key == "bgm_duck")
+            s.bgmDuck = ParseCount(val, 0, 100, s.bgmDuck, &ok);
+        else if (key == "frame_rate_limit")
+            s.frameRateLimit = ParseFrameRateLimit(val, s.frameRateLimit, &ok);
+        else {
             if (unknown) unknown->push_back(key);
             continue;
         }

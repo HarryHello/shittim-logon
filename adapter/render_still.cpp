@@ -20,6 +20,10 @@
 #include "scene.h"
 #include "scenes.h"
 
+#if defined(_WIN32)
+#include "spine_io.h"   // 1.3.0: WidePathExtension (Windows-only; mac keeps the default)
+#endif
+
 #include <spine/spine.h>
 #include <spine/Extension.h>
 #include <spine/SkeletonRenderer.h>
@@ -34,7 +38,11 @@ using namespace sl;
 
 // spine-cpp requires the host to supply its allocator.
 spine::SpineExtension *spine::getDefaultExtension() {
+#if defined(_WIN32)
+    return new sl::WidePathExtension();   // 1.3.0: UTF-8 paths through _wfopen_s
+#else
     return new spine::DefaultSpineExtension();
+#endif
 }
 
 namespace {
@@ -150,6 +158,12 @@ const char *argValue(int argc, char **argv, const char *flag, const char *fallba
 } // namespace
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    // 1.3.0: argv on Windows is ANSI; CommandLineToArgvW re-derives it as UTF-8.
+    const sl::Utf8Args utf8Args(argc, argv);
+    argc = utf8Args.argc();
+    argv = utf8Args.argv();
+#endif
     // --list-scenes prints the table and exits. It exists so that
     // lab\Bake-SceneStills.ps1 does not have to keep its own copy of the scene list:
     // it kept one, it went stale after the C++ table was corrected, and the stills it
@@ -162,10 +176,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    const std::string assets = argValue(argc, argv, "--assets",
-                                        "./assets");
-    const std::string out    = argValue(argc, argv, "--out",
-                                        "./room.png");
+    const std::string assets = argValue(argc, argv, "--assets", "assets");
+    const std::string out    = argValue(argc, argv, "--out", "room.png");
     const int   width  = std::atoi(argValue(argc, argv, "--width",  "1920"));
     const int   height = std::atoi(argValue(argc, argv, "--height", "1080"));
     const int   idle   = std::atoi(argValue(argc, argv, "--idle",   "1"));
@@ -184,7 +196,7 @@ int main(int argc, char **argv) {
     // scene.h was written by looking at only one. The day room has fewer bones, four
     // main idles instead of five and two companions instead of one, so "the rules
     // hold" is a claim that has to be checked against it rather than inherited.
-    std::string base = argValue(argc, argv, "--room", "room_night");
+    std::string base = argValue(argc, argv, "--room", "arona_workpage_nighttime_2");
     int   idleN = idle;
     int   compN = companion;
     float gain  = 1.0f;

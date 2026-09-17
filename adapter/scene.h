@@ -17,6 +17,8 @@
 #include <spine/spine.h>
 #include <spine/SkeletonRenderer.h>
 
+#include "subtitle.h"
+
 #include <cctype>
 #include <cstdio>
 #include <algorithm>
@@ -110,6 +112,30 @@ inline std::string attachmentPath(spine::Attachment *att) {
     return att->getName().buffer();
 }
 
+// Shadow and glow sprites: the room's drop shadows and water-light. They are
+// "unowned" -- they belong to neither the character nor the stage dressing, so
+// neither the exit flash nor a muted room may claim them. (1.3.0's answer to the
+// water-light problem this port had been muting by hand.)
+inline bool isShadow(const std::string &raw) {
+    return lower(raw).find("shadow") != std::string::npos;
+}
+
+inline bool isGlow(const std::string &raw) {
+    return lower(raw).find("light") != std::string::npos;
+}
+
+inline bool isUnowned(const std::string &raw) {
+    return isShadow(raw) || isGlow(raw);
+}
+
+// The parts of a face that expressions deform: blush, nose, eye-emotion sprites.
+inline bool isFacePart(const std::string &raw) {
+    const std::string s = lower(raw);
+    return s.find("emotion") != std::string::npos ||
+           s.find("nose") != std::string::npos ||
+           s.find("flush") != std::string::npos;
+}
+
 // Staging that ships inside a pose group but is not part of her: the desk and
 // chair she sits at, her drop shadow, floor glow sprites.
 //
@@ -125,8 +151,9 @@ inline std::string attachmentPath(spine::Attachment *att) {
 // where the sprite is rather than at what it is called.
 inline bool isStageDressing(const std::string &raw) {
     std::string s = lower(raw);
+    if (isUnowned(s)) return false;
     auto has = [&](const char *n) { return s.find(n) != std::string::npos; };
-    return has("desk") || has("chair") || has("shadow") || has("light");
+    return has("desk") || has("chair") || has("pot");
 }
 
 // Pose groups are the leading `B_00`, `C_01` ... prefix.
@@ -206,7 +233,7 @@ inline char dominantGroup(spine::Skeleton &sk) {
     char best = 0; int bestN = 0;
     for (size_t i = 0; i < sk.getSlots().size(); i++) {
         std::string s = attachmentPath(sk.getSlots()[i]->getAttachment());
-        if (s.empty() || isStageDressing(s)) continue;
+        if (s.empty() || isStageDressing(s) || isUnowned(s)) continue;
         char g = partGroup(s);
         if (!g) continue;
         // Indexed from 'A', not 'B'. With the range widened, `g - 'B'` is -1 for the
@@ -274,7 +301,7 @@ inline bool isSceneAttachment(spine::Attachment *att, char /*group*/,
     char g = partGroup(s);
     if (!g && slotName) g = partGroup(slotName);
     if (!g) return true;
-    return isStageDressing(s);
+    return isStageDressing(s) || isUnowned(s);
 }
 
 // Which slots are her, and where she sits in the draw order.
@@ -342,6 +369,7 @@ inline Classification classify(spine::Skeleton &sk) {
     for (size_t i = 0; i < n; i++) {
         spine::Slot *slot = sk.getSlots()[i];
         if (!slot->getAttachment()) continue;      // a slot with nothing in it is nobody's
+        if (isUnowned(attachmentPath(slot->getAttachment()))) continue;
         const int b = slot->getBone().getData().getIndex();
         if (b < 0 || (size_t)b >= nb) continue;
         (c.isChar[i] ? charBone : sceneBone)[b] = true;
@@ -351,7 +379,7 @@ inline Classification classify(spine::Skeleton &sk) {
     auto stillScenery = [&](spine::Attachment *att) {
         if (!att) return true;
         const std::string path = attachmentPath(att);
-        if (isStageDressing(path)) return true;
+        if (isStageDressing(path) || isUnowned(path)) return true;
         const std::string ls = lower(path), ln = lower(att->getName().buffer());
         return ls.rfind("bg_", 0) == 0 || ls.rfind("bg/", 0) == 0 ||
                ln.rfind("bg_", 0) == 0 || ln.rfind("bg/", 0) == 0;
@@ -381,6 +409,55 @@ inline Classification classify(spine::Skeleton &sk) {
 
     for (size_t i = 0; i < n; i++)
         if (c.isChar[i]) { c.maxIdx = (int)i; if (c.minIdx < 0) c.minIdx = (int)i; }
+
+    // 1.3.0: unowned sprites (shadow/glow) bound to a bone that descends from a
+    // character bone belong to that character -- her shadow and halo leave with
+    // her. The claim is stopped by room structure: bones under real scenery
+    // (partGroup or BG_/BG/ art, never unowned itself) mark `underRoom`, and a
+    // slot whose chain reaches a room bone first stays with the room.
+    if (nb) {
+        auto roomStructure = [&](spine::Attachment *att) {
+            if (!att) return false;
+            const std::string path = attachmentPath(att);
+            if (isUnowned(path)) return false;
+            if (partGroup(path) == 0) return true;
+            const std::string ls = lower(path), ln = lower(att->getName().buffer());
+            return ls.rfind("bg_", 0) == 0 || ls.rfind("bg/", 0) == 0 ||
+                   ln.rfind("bg_", 0) == 0 || ln.rfind("bg/", 0) == 0;
+        };
+
+        std::vector<bool> underChar(nb, false), underRoom(nb, false);
+        auto mark = [&](spine::Bone *from, std::vector<bool> &m) {
+            for (spine::Bone *b = from; b; b = b->getParent()) {
+                const int j = b->getData().getIndex();
+                if (j < 0 || (size_t)j >= nb) break;
+                m[j] = true;
+            }
+        };
+        for (size_t bi = 0; bi < nb; bi++)
+            if (charBone[bi]) mark(sk.getBones()[bi], underChar);
+        for (size_t i = 0; i < n; i++) {
+            if (c.isChar[i]) continue;
+            spine::Slot *slot = sk.getSlots()[i];
+            if (!slot->getAttachment()) continue;
+            if (!roomStructure(slot->getAttachment())) continue;
+            mark(&slot->getBone(), underRoom);
+        }
+
+        for (size_t i = 0; i < n; i++) {
+            if (c.isChar[i]) continue;
+            spine::Slot *slot = sk.getSlots()[i];
+            if (!slot->getAttachment()) continue;
+            if (!isUnowned(attachmentPath(slot->getAttachment()))) continue;
+            for (spine::Bone *b = &slot->getBone(); b; b = b->getParent()) {
+                const int bi = b->getData().getIndex();
+                if (bi <= 0 || (size_t)bi >= nb) break;
+                if (underRoom[bi]) break;
+                if (underChar[bi]) { c.isChar[i] = true; break; }
+            }
+        }
+    }
+
     return c;
 }
 
@@ -528,10 +605,20 @@ inline DrawStats drawFiltered(sl::Target &target, spine::Skeleton &sk,
 // Prints how every slot was classified. Exists because "some of her clothing stays
 // behind when she leaves" is a classification bug, and the only way to find which
 // rule let a part through is to see the rules' verdicts next to the names.
+inline bool animationSlots(spine::SkeletonData &data, const char *animName,
+                           std::vector<bool> &out);
+inline bool characterWorldBounds(spine::Skeleton &sk, const Classification &c,
+                                 float &x0, float &y0, float &x1, float &y1,
+                                 const std::vector<bool> *only);
+inline bool faceWorldBounds(spine::Skeleton &sk, const Classification &c,
+                            float &x0, float &y0, float &x1, float &y1,
+                            const std::vector<bool> *only);
+
 inline void describeClassification(spine::Skeleton &sk,
                                    int (*out)(const char *, ...),
                                    const Viewport *vp = nullptr,
-                                   int W = 0, int H = 0) {
+                                   int W = 0, int H = 0,
+                                   const char *companionAnim = nullptr) {
     const Classification c = classify(sk);
 
     // Where each slot lands on screen. Names alone were not enough: a stray halo
@@ -561,10 +648,52 @@ inline void describeClassification(spine::Skeleton &sk,
             }
         }
     }
+    // 1.3.0's "alone" column: a character slot whose whole bone ancestry carries
+    // only itself is a solo part -- the flag the pat boxes and the subtitle
+    // anchor reason about. `comp` marks the slots the companion animation moves,
+    // so the probe can print who the companion actually is.
+    std::vector<bool> alone(sk.getSlots().size(), false);
+    {
+        const size_t nb = sk.getBones().size();
+        std::vector<int> charN(nb, 0), sceneN(nb, 0);
+        for (size_t i = 0; i < sk.getSlots().size(); i++) {
+            spine::Slot *s = sk.getSlots()[i];
+            if (!s->getAttachment()) continue;
+            for (spine::Bone *b = &s->getBone(); b; b = b->getParent()) {
+                const int bi = b->getData().getIndex();
+                if (bi < 0 || (size_t)bi >= nb) break;
+                (i < c.isChar.size() && c.isChar[i] ? charN : sceneN)[bi]++;
+            }
+        }
+        for (size_t i = 0; i < sk.getSlots().size(); i++) {
+            if (i >= c.isChar.size() || !c.isChar[i]) continue;
+            spine::Attachment *att = sk.getSlots()[i]->getAttachment();
+            if (!att) continue;
+
+            if (isUnowned(attachmentPath(att))) continue;
+
+            spine::Bone &own = sk.getSlots()[i]->getBone();
+            const int oi = own.getData().getIndex();
+            int group = (oi >= 0 && (size_t)oi < nb) ? charN[oi] : 1;
+            for (spine::Bone *b = own.getParent(); b; b = b->getParent()) {
+                const int bi = b->getData().getIndex();
+                if (bi < 0 || (size_t)bi >= nb) break;
+                if (sceneN[bi]) break;
+                if (charN[bi] > group) group = charN[bi];
+            }
+            alone[i] = group <= 1;
+        }
+    }
+
+    std::vector<bool> comp;
+    const bool haveComp = companionAnim && *companionAnim &&
+                          animationSlots(*sk.getData(), companionAnim, comp);
+
     out("    dominant group '%c', character slots %d..%d of %d\n",
         c.group ? c.group : '?', c.minIdx, c.maxIdx, (int)sk.getSlots().size());
-    out("    %-4s %-30s %-32s %-5s %-6s %-6s %-5s %-28s\n",
-        "idx", "slot", "attachment", "group", "alpha", "dress", "char", "bone <- parent");
+    out("    %-4s %-30s %-32s %-5s %-6s %-4s %-6s %-5s %-5s %-4s %-28s\n",
+        "idx", "slot", "attachment", "group", "alpha", "bl", "dress", "char",
+        "alone", "comp", "bone <- parent");
     for (size_t i = 0; i < sk.getSlots().size(); i++) {
         spine::Slot *s = sk.getSlots()[i];
         const std::string path = attachmentPath(s->getAttachment());
@@ -584,11 +713,174 @@ inline void describeClassification(spine::Skeleton &sk,
             const char *pn = b->getParent() ? b->getParent()->getData().getName().buffer() : "-";
             std::snprintf(bone, sizeof(bone), "%s <- %s", b->getData().getName().buffer(), pn);
         }
-        out("    %-4d %-30s %-32s %-5c %-6.2f %-6s %-5s %-28s %s\n",
+        const char *bl = "nrm";
+        switch (s->getData().getBlendMode()) {
+        case spine::BlendMode_Additive: bl = "add"; break;
+        case spine::BlendMode_Multiply: bl = "mul"; break;
+        case spine::BlendMode_Screen:   bl = "scr"; break;
+        default: break;
+        }
+        out("    %-4d %-30s %-32s %-5c %-6.2f %-4s %-6s %-5s %-5s %-4s %-28s %s\n",
             (int)i, s->getData().getName().buffer(), path.c_str(),
-            g ? g : '-', s->getColor().a,
-            isStageDressing(path) ? "yes" : "", c.isChar[i] ? "CHAR" : "", bone, box);
+            g ? g : '-', s->getColor().a, bl,
+            isStageDressing(path) ? "yes"
+                : isShadow(path) ? "shadow" : isGlow(path) ? "light" : "",
+            c.isChar[i] ? "CHAR" : "", alone[i] ? "ALONE" : "",
+            (haveComp && i < comp.size() && comp[i]) ? "CMP" : "", bone, box);
     }
+
+    // Where the subtitle would hang for each figure on screen, solved for real --
+    // the same Solve/Place the renderer calls, fed this viewport. The reason it
+    // is here: the anchor is the character's chest, and the one thing that can
+    // move the panel is her face; both fail silently and are invisible in any
+    // name-based check.
+    if (vp && W > 0 && H > 0) {
+        const float sx = W / vp->width, sy = H / vp->height, top = vp->bottom + vp->height;
+        auto say = [&](const char *who, const std::vector<bool> *mask) {
+            float x0, y0, x1, y1;
+            if (!characterWorldBounds(sk, c, x0, y0, x1, y1, mask)) {
+                out("    %-10s (nobody)\n", who);
+                return;
+            }
+            const float l = (x0 - vp->left) * sx, r = (x1 - vp->left) * sx;
+            const float t = (top - y1) * sy, b = (top - y0) * sy;
+            const int ax = (int)((l + r) * 0.5f);
+            const int ay = (int)(t + (b - t) * subtitle::kAnchorDownFrac);
+            out("    %-10s x %.0f..%.0f  y %.0f..%.0f   anchor %d,%d\n",
+                who, l, r, t, b, ax, ay);
+
+            subtitle::Box face;
+            float fx0, fy0, fx1, fy1;
+            if (faceWorldBounds(sk, c, fx0, fy0, fx1, fy1, mask)) {
+                face.left   = (int)((fx0 - vp->left) * sx);
+                face.right  = (int)((fx1 - vp->left) * sx);
+                face.top    = (int)((top - fy1) * sy);
+                face.bottom = (int)((top - fy0) * sy);
+                out("    %-10s  face x %d..%d  y %d..%d%s\n", "",
+                    face.left, face.right, face.top, face.bottom,
+                    ay < face.bottom ? "   <- THE ANCHOR IS ON HER FACE" : "");
+            } else {
+                out("    %-10s  face: none on screen -- the panel is not pushed\n", "");
+            }
+
+            const subtitle::Solved sol = subtitle::Solve("嗯...", H);
+            const subtitle::Placement p = subtitle::Place(
+                sol, ax, ay, {0, 0, W, H}, nullptr, 0, face.empty() ? nullptr : &face);
+            out("    %-10s  panel %d,%d..%d,%d%s%s%s\n", "",
+                p.panel.left, p.panel.top, p.panel.right, p.panel.bottom,
+                p.visible ? "" : "   <- NOT DRAWN AT ALL",
+                p.movedForFace ? "   moved down off her face" : "",
+                (!face.empty() && p.panel.intersects(face))
+                    ? "   <- STILL ON HER FACE" : "");
+        };
+        out("    -- where the subtitle hangs --\n");
+        say("everybody", nullptr);
+        if (haveComp) {
+            std::vector<bool> occupant(comp.size());
+            for (size_t i = 0; i < comp.size(); i++) occupant[i] = !comp[i];
+            say("occupant", &occupant);
+            say("companion", &comp);
+        }
+    }
+}
+
+// The slots an animation actually moves, direct from the timeline property ids:
+// bone properties map to the slot via its ancestry, slot properties and the
+// packed ones (deform, sequence) carry the slot index themselves. The companion
+// probe and the voice/subtitle planning both need "who does this animation
+// touch" answered from data rather than from a name.
+inline bool animationSlots(spine::SkeletonData &data, const char *animName,
+                           std::vector<bool> &out) {
+    out.assign(data.getSlots().size(), false);
+    if (!animName || !*animName) return false;
+    spine::Animation *anim = data.findAnimation(animName);
+    if (!anim) return false;
+
+    const long long kBone = spine::Property_Rotate | spine::Property_X |
+                            spine::Property_Y | spine::Property_ScaleX |
+                            spine::Property_ScaleY | spine::Property_ShearX |
+                            spine::Property_ShearY | spine::Property_Inherit;
+    const long long kSlot = spine::Property_Rgb | spine::Property_Alpha |
+                            spine::Property_Rgb2 | spine::Property_Attachment;
+    const long long kPacked = spine::Property_Deform | spine::Property_Sequence;
+
+    const size_t nb = data.getBones().size();
+    std::vector<bool> bone(nb, false);
+    bool any = false;
+    spine::Vector<spine::Timeline *> &tls = anim->getTimelines();
+    for (size_t t = 0; t < tls.size(); t++) {
+        spine::Vector<spine::PropertyId> &ids = tls[t]->getPropertyIds();
+        for (size_t k = 0; k < ids.size(); k++) {
+            const long long prop = (long long)(ids[k] >> 32);
+            const long long low  = (long long)(ids[k] & 0xFFFFFFFFll);
+            const long long slot = (prop & kPacked) ? (low >> 16) : low;
+            if (prop & kBone) {
+                if (low >= 0 && (size_t)low < nb) { bone[(size_t)low] = true; any = true; }
+            } else if (prop & (kSlot | kPacked)) {
+                if (slot >= 0 && (size_t)slot < out.size()) {
+                    out[(size_t)slot] = true; any = true;
+                }
+            }
+        }
+    }
+    if (!any) return false;
+
+    for (size_t i = 0; i < data.getSlots().size(); i++) {
+        if (out[i]) continue;
+        for (spine::BoneData *b = &data.getSlots()[i]->getBoneData(); b; b = b->getParent()) {
+            const int bi = b->getIndex();
+            if (bi >= 0 && (size_t)bi < nb && bone[(size_t)bi]) { out[i] = true; break; }
+        }
+    }
+    return true;
+}
+
+// The world box of the character's (optionally only `only`'s, optionally
+// face-only) slots, from the attachments' own vertices -- exact, unlike
+// geometryWorldBounds, which is a whole-skeleton superset.
+inline bool slotsWorldBounds(spine::Skeleton &sk, const Classification &c,
+                             const std::vector<bool> *only, bool faceOnly,
+                             float &x0, float &y0, float &x1, float &y1) {
+    x0 = y0 = 1e9f; x1 = y1 = -1e9f;
+    bool any = false;
+    spine::Vector<float> v;
+    for (size_t i = 0; i < sk.getSlots().size() && i < c.isChar.size(); i++) {
+        if (!c.isChar[i]) continue;
+        if (only && (i >= only->size() || !(*only)[i])) continue;
+        spine::Slot *s = sk.getSlots()[i];
+        if (faceOnly && !isFacePart(s->getData().getName().buffer()) &&
+            !isFacePart(attachmentPath(s->getAttachment()))) continue;
+        if (s->getColor().a <= 0.004f) continue;
+        spine::Attachment *att = s->getAttachment();
+        int n = 0;
+        if (auto *r = dynamic_cast<spine::RegionAttachment *>(att)) {
+            v.setSize(8, 0); r->computeWorldVertices(*s, v, 0, 2); n = 4;
+        } else if (auto *m = dynamic_cast<spine::MeshAttachment *>(att)) {
+            n = (int)m->getWorldVerticesLength() / 2;
+            v.setSize(n * 2, 0); m->computeWorldVertices(*s, 0, n * 2, v, 0, 2);
+        } else continue;
+        for (int k = 0; k < n; k++) {
+            const float wx = v[k * 2], wy = v[k * 2 + 1];
+            if (wx < x0) x0 = wx;
+            if (wx > x1) x1 = wx;
+            if (wy < y0) y0 = wy;
+            if (wy > y1) y1 = wy;
+            any = true;
+        }
+    }
+    return any && x1 > x0 && y1 > y0;
+}
+
+inline bool characterWorldBounds(spine::Skeleton &sk, const Classification &c,
+                                 float &x0, float &y0, float &x1, float &y1,
+                                 const std::vector<bool> *only = nullptr) {
+    return slotsWorldBounds(sk, c, only, false, x0, y0, x1, y1);
+}
+
+inline bool faceWorldBounds(spine::Skeleton &sk, const Classification &c,
+                            float &x0, float &y0, float &x1, float &y1,
+                            const std::vector<bool> *only = nullptr) {
+    return slotsWorldBounds(sk, c, only, true, x0, y0, x1, y1);
 }
 
 // The world box of every triangle the skeleton emits: a guaranteed superset of
