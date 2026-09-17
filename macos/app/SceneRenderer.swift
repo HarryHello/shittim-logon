@@ -70,6 +70,25 @@ final class SceneRenderer {
         c.rgb *= c.a;             // premultiply for the blend states
         return c;
     }
+
+    // The wake's white-silhouette pass: same geometry, same blending, but the
+    // fragment keeps only the silhouette's alpha and writes premultiplied
+    // white. Vertex colour cannot produce this -- it multiplies the texture,
+    // so a black coat tinted white is still a black coat -- whiteness must be
+    // decided after texturing.
+    fragment float4 fsWhite(VOut in [[stage_in]],
+                            constant float4 &hole [[buffer(0)]],
+                            texture2d<float> tex [[texture(0)]],
+                            sampler smp [[sampler(0)]]) {
+        if (hole.z > 0.0 && hole.w > 0.0 &&
+            in.px.x >= hole.x && in.px.x < hole.x + hole.z &&
+            in.px.y >= hole.y && in.px.y < hole.y + hole.w) {
+            return float4(0.0);
+        }
+        float4 t = tex.sample(smp, in.uv);
+        float a = t.a * in.col.a;
+        return float4(a, a, a, a);
+    }
     """
 
     init(device: MTLDevice) throws {
@@ -113,6 +132,36 @@ final class SceneRenderer {
             pd.colorAttachments[0].destinationAlphaBlendFactor = m.3
             pipelines.append(try device.makeRenderPipelineState(descriptor: pd))
         }
+        // Blend index 4: the white core (fsWhite, normal blending).
+        let white = MTLRenderPipelineDescriptor()
+        white.vertexFunction = library.makeFunction(name: "vsMain")
+        white.fragmentFunction = library.makeFunction(name: "fsWhite")
+        white.vertexDescriptor = vd
+        white.colorAttachments[0].pixelFormat = .bgra8Unorm
+        white.colorAttachments[0].isBlendingEnabled = true
+        white.colorAttachments[0].rgbBlendOperation = .add
+        white.colorAttachments[0].alphaBlendOperation = .add
+        white.colorAttachments[0].sourceRGBBlendFactor = .one
+        white.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        white.colorAttachments[0].sourceAlphaBlendFactor = .one
+        white.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        pipelines.append(try device.makeRenderPipelineState(descriptor: white))
+        // Blend index 5: the same white silhouette, ADDITIVE -- the glow
+        // layer. It re-draws the silhouette slightly puffed and only adds
+        // light, which is what bleeds past her outline without occluding.
+        let glow = MTLRenderPipelineDescriptor()
+        glow.vertexFunction = library.makeFunction(name: "vsMain")
+        glow.fragmentFunction = library.makeFunction(name: "fsWhite")
+        glow.vertexDescriptor = vd
+        glow.colorAttachments[0].pixelFormat = .bgra8Unorm
+        glow.colorAttachments[0].isBlendingEnabled = true
+        glow.colorAttachments[0].rgbBlendOperation = .add
+        glow.colorAttachments[0].alphaBlendOperation = .add
+        glow.colorAttachments[0].sourceRGBBlendFactor = .one
+        glow.colorAttachments[0].destinationRGBBlendFactor = .one
+        glow.colorAttachments[0].sourceAlphaBlendFactor = .one
+        glow.colorAttachments[0].destinationAlphaBlendFactor = .one
+        pipelines.append(try device.makeRenderPipelineState(descriptor: glow))
     }
 
     // MARK: textures
@@ -134,16 +183,29 @@ final class SceneRenderer {
         return t
     }
 
-    /// Render text into a texture (straight alpha), for the in-scene clock.
-    func makeTextTexture(text: String, fontSize: CGFloat) -> MTLTexture? {
-        let W = 720, H = 200
+    /// The in-scene clock, staged like the reference: big 24-hour time with
+    /// the localized date under it, both centred in a 900x380 texture.
+    func makeClockTexture(time: String, date: String) -> MTLTexture? {
+        let W = 900, H = 380
         let img = NSImage(size: NSSize(width: W, height: H))
         img.lockFocus()
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .light),
+        let timeAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 168, weight: .light),
             .foregroundColor: NSColor.white,
         ]
-        (text as NSString).draw(at: NSPoint(x: 10, y: 10), withAttributes: attrs)
+        let dateAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 46, weight: .medium),
+            .foregroundColor: NSColor.white,
+        ]
+        let tSize = (time as NSString).size(withAttributes: timeAttrs)
+        let dSize = (date as NSString).size(withAttributes: dateAttrs)
+        (time as NSString).draw(at: NSPoint(x: (CGFloat(W) - tSize.width) / 2,
+                                            y: CGFloat(H) - tSize.height - 16),
+                                withAttributes: timeAttrs)
+        (date as NSString).draw(at: NSPoint(x: (CGFloat(W) - dSize.width) / 2,
+                                            y: CGFloat(H) - tSize.height - 16
+                                                - dSize.height - 12),
+                                withAttributes: dateAttrs)
         img.unlockFocus()
         guard let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
 
@@ -232,22 +294,14 @@ final class SceneRenderer {
 
         enc.setVertexBuffer(vertBuffer, offset: 0, index: 0)
 
-        for i in 0..<Int(batchCount) {
-            let b = sb[i]
-            let page = Int(b.page)
-            let blend = Int(b.blend)
-            let indexOffset = Int(b.indexOffset)
-            let indexCount = Int(b.indexCount)
-            guard page < Int(sb_page_count()), let tex = texture(forPage: page) else { continue }
-            enc.setRenderPipelineState(pipelines[min(max(blend, 0), 3)])
-            enc.setFragmentTexture(tex, index: 0)
-            enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
-                                      indexType: .uint16, indexBuffer: indexBuffer!,
-                                      indexBufferOffset: indexOffset * 2)
-        }
-
-        // in-scene clock, top-centre
-        if let clockTexture, clockRect.width > 0 {
+        // in-scene clock, staged like the reference: above the room (and its
+        // leaving characters), BELOW the foreground figure so she occludes
+        // it. Drawn just before the first foreground batch, or at the end if
+        // the foreground never appears.
+        let roomPages = Int(sb_room_page_count())
+        var clockDrawn = false
+        func drawClock() {
+            guard let clockTexture, clockRect.width > 0 else { return }
             enc.setRenderPipelineState(pipelines[0])
             enc.setFragmentTexture(clockTexture, index: 0)
             struct QuadVert { var x, y, u, v: Float; var r, g, b, a: UInt8 }
@@ -260,9 +314,35 @@ final class SceneRenderer {
                 QuadVert(x: x0 + cw, y: y0 + ch, u: 1, v: 1, r: 255, g: 255, b: 255, a: 255),
             ]
             enc.setVertexBytes(quad, length: 4 * 20, index: 0)
-            // the quad uses the same vertex layout (pos, uv, color, stride 20)
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            // setVertexBytes replaced the binding at index 0 for the whole
+            // encoder: every batch after the clock would otherwise render
+            // with the four clock vertices as its vertex buffer -- the
+            // foreground figure vanished exactly this way. Re-bind.
+            if let vertBuffer {
+                enc.setVertexBuffer(vertBuffer, offset: 0, index: 0)
+            }
         }
+
+        for i in 0..<Int(batchCount) {
+            let b = sb[i]
+            let page = Int(b.page)
+            let blend = Int(b.blend)
+            let indexOffset = Int(b.indexOffset)
+            let indexCount = Int(b.indexCount)
+            if !clockDrawn, page >= roomPages {
+                drawClock()
+                clockDrawn = true
+            }
+            guard page < Int(sb_page_count()), let tex = texture(forPage: page) else { continue }
+            // 0..3 the spine blend modes; 4 white core; 5 white glow.
+            enc.setRenderPipelineState(pipelines[min(max(blend, 0), 5)])
+            enc.setFragmentTexture(tex, index: 0)
+            enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
+                                      indexType: .uint16, indexBuffer: indexBuffer!,
+                                      indexBufferOffset: indexOffset * 2)
+        }
+        if !clockDrawn { drawClock() }
 
         enc.endEncoding()
         cmd.present(drawable)

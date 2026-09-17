@@ -11,8 +11,10 @@ room=arona_workpage_nighttime_2
 idle=1
 companion=11
 
-# 前景角色骨架(B 阶段)。留空 = B 阶段停留在 A。
-character=arona_spr
+# 前景角色骨架(B 阶段,激活时走到镜头前;房间里的她随之淡出)。
+# 夜晚场景用 Plana(NP0035_spr,黑衣白发);白天场景用 arona_spr。
+# 留空 = B 阶段停留在 A。
+character=NP0035_spr
 # 前景角色的动画名。留空 = 骨架里第一个含 Idle 的动画。
 character_anim=
 

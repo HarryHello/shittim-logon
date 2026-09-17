@@ -65,6 +65,42 @@ float g_charAlpha = 0.0f;
 scene::Viewport g_charViewport;
 bool g_charViewportValid = false;
 
+// Opacity of the characters that live INSIDE the room (the seated figure at
+// her desk, the companion standing outside). On wake the foreground figure
+// appears and these leave: the engine ramps this down from 1 as the
+// foreground fades in, so she "walks out of the scene" instead of there
+// being two of her.
+float g_roomCharsAlpha = 1.0f;
+
+// The foreground camera is stored as a height plus her centre X, never as a
+// full viewport: its width must follow the aspect of the CURRENT target or
+// the character is drawn with sx != sy -- measured on this display, a camera
+// solved for the 16:9 scratch renders on the 1.54:1 lock screen at 0.865x
+// horizontal scale, visibly squashed and pushed sideways. frameCharacter
+// solved on the scratch aspect because that is all it knew; the emit re-derives.
+constexpr float kCharXFrac = 0.31f;   // her centre sits left of the middle
+float g_charCenterX = 0.0f;           // world x of her scan-box centre
+
+// The wake's tint flash: the material's own effect. FINDINGS records the
+// reference's keyframe #23 with the characters flashing white -- each with
+// its own tint -- and the exit carrying a silhouette-cut flash, so both the
+// entrance and the exit read as a white-silhouette materialise, never a
+// plain crossfade. 0 = normal colours, 1 = pure white silhouette.
+float g_charFlash = 0.0f;       // the foreground figure's flash
+float g_roomCharsFlash = 0.0f;  // the room characters' flash as they leave
+
+// The flash's light, matched against the in-game recording: the figure is
+// swallowed by a blown-out blob of light, not outlined as a white shape --
+// at the peak no component edge survives. One additive rim cannot do that;
+// stacking puffed copies of the silhouette can. The core (blend 4) supplies
+// the shape; each glow layer (blend 5) re-draws it scaled around its
+// centroid, additively. The stack saturates the centre into the clamp --
+// which is what erases the per-attachment edges -- and feathers the
+// falloff outward into the recording's soft halo.
+constexpr int   kGlowLayers = 3;
+constexpr float kGlowScale[kGlowLayers] = {1.14f, 1.32f, 1.55f};
+constexpr float kGlowAlpha[kGlowLayers] = {0.45f, 0.28f, 0.16f};
+
 std::vector<SBBatchVertex> g_vertices;
 
 // Protect rects (fractions of the screen): anything whose screen
@@ -95,10 +131,32 @@ static bool pathMuted(const std::string& path) {
         if (low.find(p) != std::string::npos) return true;
     return false;
 }
-bool g_roomCharOnly = true;   // room renders its character slots only; the
-                              // static room comes from the wallpaper still
 std::vector<unsigned short> g_indices;
 std::vector<SBBatch> g_batches;
+
+// ---------------------------------------------------------------- fullscreen fx
+//
+// The drifting triangle particles (scenes.h's fullscreenFx, recorded in the
+// reference's steady state): translucent triangle outlines scattered over the
+// whole screen, falling slowly, swaying, and flickering in and out. One
+// sprite texture (FX_TEX_Triangle_02_1.png -- two outline triangles, one
+// half each of a 256x128 sheet) is loaded as an EXTRA page after the
+// room's and the character's atlas pages; the particles are emitted as
+// direct quads on that page, additively, so they only ever add light.
+//
+// Positions are FRACTIONS of the target, so the layer survives any screen
+// size; sizes scale with height against a 1440-tall reference.
+struct FxParticle {
+    float x, y;      // position, fractions of the target
+    float size;      // px at a 1440-tall reference
+    float fall;      // y fraction per second
+    float sway;      // x fraction of sway amplitude
+    float phase;     // sway/flicker phase
+    float flicker;   // flicker rate, rad/s
+    bool  flip;      // which of the sheet's two triangles
+};
+std::unique_ptr<sl::Image> g_fx;
+std::vector<FxParticle> g_fxParts;
 
 bool setupSlot(SbSlot& s, const char* assets, const char* name) {
     try {
@@ -140,6 +198,28 @@ int playIfPresentGuarded(SbSlot& s, int track, const char* name, int loop) {
 
 // ---------------------------------------------------------------- lifecycle
 
+int sb_load_fx(const char* pngPath) {
+    auto img = std::make_unique<sl::Image>(sl::loadPng(pngPath));
+    if (!img || img->width <= 0 || img->height <= 0) return 1;
+    g_fx = std::move(img);
+    if (g_fxParts.empty()) {
+        std::srand(20260914);
+        for (int i = 0; i < 34; ++i) {
+            FxParticle p;
+            p.x = (std::rand() % 1000) / 1000.0f;
+            p.y = (std::rand() % 1000) / 1000.0f;
+            p.size = 16.0f + (std::rand() % 1000) / 1000.0f * 44.0f;
+            p.fall = 0.010f + (std::rand() % 1000) / 1000.0f * 0.022f;
+            p.sway = 0.006f + (std::rand() % 1000) / 1000.0f * 0.014f;
+            p.phase = (std::rand() % 628) / 100.0f;
+            p.flicker = 0.8f + (std::rand() % 1000) / 1000.0f * 1.4f;
+            p.flip = (std::rand() % 2) == 0;
+            g_fxParts.push_back(p);
+        }
+    }
+    return 0;
+}
+
 int sb_load_room(const char* assetsDir, const char* roomName) {
     g_room = SbSlot();
     return setupSlot(g_room, assetsDir, roomName) ? 0 : 1;
@@ -152,12 +232,20 @@ int sb_load_character(const char* assetsDir, const char* characterName) {
     // Frame the foreground camera once, at setup pose. frameCharacter cannot
     // clip by construction (it measures through the geometry box), so one
     // solve is enough; there is no iteration to diverge.
+    //
+    // THIS MEASUREMENT IS ONLY A FALLBACK. This skeleton's setup pose is not
+    // a standing figure -- it is a flat spread (bounds y -190..207, 397 units
+    // tall) while the animation's pose stands ~2130 units tall. A camera
+    // solved on the setup pose magnifies the live pose ~5x, pushes the body
+    // off-screen, and leaves her headband poking into a corner. The engine
+    // calls sb_character_reframe after choosing the animation, which
+    // re-solves on the settled animated pose.
     sl::Target scratch;
     scratch.resize(480, 270);
     SkeletonRenderer probe;
     float visibleW = 0, visibleH = 0;
     scene::Viewport vp = scene::frameCharacter(scratch, *incoming.skeleton, probe,
-                                               0.38f /*xFrac: character sits left of centre*/,
+                                               kCharXFrac /*her centre left of centre*/,
                                                0.62f /*visibleFrac: crops low body, reads as foreground*/,
                                                0.06f /*topMargin*/,
                                                &visibleW, &visibleH);
@@ -165,9 +253,38 @@ int sb_load_character(const char* assetsDir, const char* characterName) {
 
     g_char = std::move(incoming);
     g_charViewport = vp;
+    g_charCenterX = vp.left + kCharXFrac * vp.width;
     g_charViewportValid = true;
     g_hasChar = true;
     g_charAlpha = 0.0f;
+    return 0;
+}
+
+// Re-solve the foreground camera on the pose that will actually be on
+// stage: settle ~2 s of mixes and physics (the same tick sequence the
+// live loop uses), then measure. Called by the engine right after the
+// character's animation is chosen, because the setup-pose framing of
+// sb_load_character is only a fallback -- see the comment there.
+int sb_character_reframe(void) {
+    if (!g_hasChar) return 1;
+    const float step = 1.0f / 60.0f;
+    for (float t = 0.0f; t < 2.0f; t += step) {
+        g_char.state->update(step);
+        g_char.state->apply(*g_char.skeleton);
+        g_char.skeleton->update(step);
+        g_char.skeleton->updateWorldTransform(spine::Physics_Update);
+    }
+    sl::Target scratch;
+    scratch.resize(480, 270);
+    SkeletonRenderer probe;
+    float visibleW = 0, visibleH = 0;
+    scene::Viewport vp = scene::frameCharacter(scratch, *g_char.skeleton, probe,
+                                               kCharXFrac, 0.62f, 0.06f,
+                                               &visibleW, &visibleH);
+    if (vp.width <= 0) return 2;
+    g_charViewport = vp;
+    g_charCenterX = vp.left + kCharXFrac * vp.width;
+    g_charViewportValid = true;
     return 0;
 }
 
@@ -200,10 +317,32 @@ void sb_tick(float dt) {
         g_char.skeleton->update(step);
         g_char.skeleton->updateWorldTransform(spine::Physics_Update);
     }
+    // Fullscreen fx: fall, wrap at the bottom edge, sway and flicker.
+    for (auto& p : g_fxParts) {
+        p.y += p.fall * step;
+        if (p.y > 1.1f) {
+            p.y = -0.1f;
+            p.x = (std::rand() % 1000) / 1000.0f;
+        }
+        p.phase += p.flicker * step;
+    }
 }
 
 void sb_set_character_alpha(float alpha) {
     g_charAlpha = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+}
+
+void sb_set_room_chars_alpha(float alpha) {
+    g_roomCharsAlpha = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+}
+
+// The wake's white-silhouette flash, per figure. 1 = pure white silhouette,
+// 0 = normal colours.
+void sb_set_character_flash(float flash) {
+    g_charFlash = flash < 0.0f ? 0.0f : (flash > 1.0f ? 1.0f : flash);
+}
+void sb_set_room_chars_flash(float flash) {
+    g_roomCharsFlash = flash < 0.0f ? 0.0f : (flash > 1.0f ? 1.0f : flash);
 }
 
 int sb_render(int width, int height,
@@ -214,75 +353,118 @@ int sb_render(int width, int height,
     g_indices.clear();
     g_batches.clear();
 
-    // The room renders in the skeleton's own draw order (scene.h: the
-    // background is underneath everything and occlusion is natural in a
-    // single pass when the canvas is ours). The foreground character renders
-    // above it through its own camera.
-    // Mute slots whose screen bounds intersect a protect rect (the
-    // system clock and password field): they render beneath our
-    // scene, so muting keeps them readable. Restored right after emit.
-    std::vector<std::pair<spine::Slot*, float>> savedAlphas;
-    auto muteProtected = [&](const scene::Viewport& vp, spine::Skeleton& sk) {
-        if (!g_protect.enabled) return;
+    //   room pass 0  the room's non-character stage (walls, sea, desks,
+    //                dressing). mute_patterns and the protect rects mute
+    //                here; the system UI reads through.
+    //   room pass 1  the room's own characters, fading with their exit.
+    //   char pass 2  the foreground figure, fading in.
+    //
+    // The white passes (style 1/2) re-emit the same slots through the
+    // white-silhouette pipeline (blend 4: fsWhite keeps the silhouette's
+    // alpha and writes premultiplied white; blend 5: the same, additive).
+    // The flash is the recording's light-blob, not a white outline: the
+    // core layer runs translucent and the kGlow* layers stack puffed
+    // additive copies on top, so the centre clamps to pure white -- which
+    // is what hides the per-attachment edges -- and only the falloff shows
+    // the silhouette's broad shape. Additive white cannot occlude, it only
+    // adds light.
+    //
+    // The white layer's alpha is the flash amount (scaled per layer), never
+    // multiplied by the body's own alpha: she appears AS the light and
+    // resolves into her colours.
+    //
+    // spine merges render commands by texture+blend+colour, so the room's
+    // characters cannot be separated from the backdrop inside one command
+    // list; the two passes do it by muting the other side's slots to alpha
+    // 0 per pass. The characters now draw after the stage, which during the
+    // exit puts the companion briefly in front of the wall -- accepted: she
+    // is fading out under the glow at the same time.
+    //
+    // Each pass save/restores what it mutates, so the pose state survives.
+    struct SavedColor { spine::Slot* slot; float a, r, g, b; };
+    auto emit = [&](SbSlot& s, const scene::Viewport& vp, float alpha,
+                    int pass, int style, float puffK = 1.0f) {
+        // style 0 = normal colours; 1 = white core (normal blend);
+        // 2 = white glow (additive, puffed by puffK around the silhouette).
+        std::vector<SavedColor> saved;
+        const scene::Classification cls = scene::classify(*s.skeleton);
+        const bool room = &s == &g_room;
+
         const float sx = float(width) / vp.width;
         const float sy = float(height) / vp.height;
         const float top = vp.bottom + vp.height;
         spine::Vector<float> wv;
-        for (size_t si = 0; si < sk.getSlots().size(); ++si) {
-            spine::Slot* slot = sk.getSlots()[si];
+        for (size_t i = 0; i < s.skeleton->getSlots().size(); ++i) {
+            spine::Slot* slot = s.skeleton->getSlots()[i];
             spine::Attachment* att = slot->getAttachment();
             if (!att) continue;
-            int n = 0;
-            if (auto* r = dynamic_cast<spine::RegionAttachment*>(att)) {
-                wv.setSize(8, 0); r->computeWorldVertices(*slot, wv, 0, 2); n = 4;
-            } else if (auto* m = dynamic_cast<spine::MeshAttachment*>(att)) {
-                n = (int)m->getWorldVerticesLength() / 2;
-                wv.setSize(n * 2, 0); m->computeWorldVertices(*slot, 0, n * 2, wv, 0, 2);
-            } else continue;
-            float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
-            for (int k = 0; k < n; ++k) {
-                const float px = (wv[k * 2] - vp.left) * sx;
-                const float py = (top - wv[k * 2 + 1]) * sy;
-                minX = std::min(minX, px); maxX = std::max(maxX, px);
-                minY = std::min(minY, py); maxY = std::max(maxY, py);
-            }
-            const auto path = lowerAscii(scene::attachmentPath(att));
-            if (pathMuted(path)) {
-                savedAlphas.push_back({slot, slot->getColor().a});
-                slot->getColor().a = 0;
-            }
-        }
-    };
-    auto restoreMuted = [&]() {
-        for (auto& e : savedAlphas) e.first->getColor().a = e.second;
-        savedAlphas.clear();
-    };
-    auto emit = [&](SbSlot& s, const scene::Viewport& vp, float alpha) {
-        muteProtected(vp, *s.skeleton);
 
-        // Room pass: characters only. The static room comes from the wallpaper
-        // still, so the live layer must not re-draw walls/desks over the
-        // system clock/password.
-        scene::Classification cls = scene::classify(*s.skeleton);
-        std::vector<std::pair<spine::Slot*, float>> passSaved;
-        if (&s == &g_room && g_roomCharOnly) {
-            for (size_t i = 0; i < s.skeleton->getSlots().size(); ++i) {
-                // Keep characters and stage dressing (desks/chairs/shadows/
-                // lights -- the furniture the scene is "made of"); mute only
-                // the big backdrop pieces (walls/windows/sea), which would
-                // otherwise cover the system clock and password field.
-                spine::Slot* slot = s.skeleton->getSlots()[i];
-                const bool isChar = !scene::hiddenInPass(cls, i, scene::Pass::CharOnly);
-                const bool dressing = scene::isStageDressing(
-                    scene::attachmentPath(slot->getAttachment()));
-                if (isChar || dressing) continue;
-                passSaved.push_back({slot, slot->getColor().a});
-                slot->getColor().a = 0;
+            float aMul = alpha;
+            if (room) {
+                const bool isChar = cls.isChar[i];
+                if (pass == 0 && isChar) aMul = 0.0f;    // stage pass: she is off
+                if (pass == 1 && !isChar) aMul = 0.0f;   // exit pass: stage is off
+            }
+
+            bool muted = room && pathMuted(lowerAscii(scene::attachmentPath(att)));
+            if (!muted && room && g_protect.enabled) {
+                int n = 0;
+                if (auto* r = dynamic_cast<spine::RegionAttachment*>(att)) {
+                    wv.setSize(8, 0); r->computeWorldVertices(*slot, wv, 0, 2); n = 4;
+                } else if (auto* m = dynamic_cast<spine::MeshAttachment*>(att)) {
+                    n = (int)m->getWorldVerticesLength() / 2;
+                    wv.setSize(n * 2, 0); m->computeWorldVertices(*slot, 0, n * 2, wv, 0, 2);
+                } else continue;
+                float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+                for (int k = 0; k < n; ++k) {
+                    const float px = (wv[k * 2] - vp.left) * sx;
+                    const float py = (top - wv[k * 2 + 1]) * sy;
+                    minX = std::min(minX, px); maxX = std::max(maxX, px);
+                    minY = std::min(minY, py); maxY = std::max(maxY, py);
+                }
+                auto hits = [&](const float* r) {
+                    return minX < (r[0] + r[2]) * float(width) &&
+                           maxX > r[0] * float(width) &&
+                           minY < (r[1] + r[3]) * float(height) &&
+                           maxY > r[1] * float(height);
+                };
+                muted = hits(g_protect.clock) || hits(g_protect.pwd);
+            }
+            if (muted) aMul = 0.0f;
+
+            if (aMul != slot->getColor().a) {
+                spine::Color& c = slot->getColor();
+                saved.push_back({slot, c.a, c.r, c.g, c.b});
+                c.a = aMul;
             }
         }
 
+        // The glow layer puffs the silhouette around its own centre. Two
+        // sweeps over the commands: the first measures the alpha-weighted
+        // extent in screen pixels, the second emits puffed around it.
+        const bool puff = style == 2;
+        float cx = 0, cy = 0;
+        std::vector<spine::RenderCommand*> cmds;
         for (spine::RenderCommand* cmd = s.renderer->render(*s.skeleton); cmd; cmd = cmd->next) {
             if (!cmd->texture || !cmd->numVertices) continue;
+            if (puff) {
+                float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
+                for (int i = 0; i < cmd->numVertices; ++i) {
+                    if (((cmd->colors[i] >> 24) & 0xFF) == 0) continue;
+                    const float px = (cmd->positions[i * 2] - vp.left) * sx;
+                    const float py = (top - cmd->positions[i * 2 + 1]) * sy;
+                    bx0 = std::min(bx0, px); bx1 = std::max(bx1, px);
+                    by0 = std::min(by0, py); by1 = std::max(by1, py);
+                }
+                if (bx1 > bx0 && by1 > by0) {
+                    cx = (cx * 0.5f) + ((bx0 + bx1) * 0.5f) * 0.5f;
+                    cy = (cy * 0.5f) + ((by0 + by1) * 0.5f) * 0.5f;
+                }
+            }
+            cmds.push_back(cmd);
+        }
+
+        for (spine::RenderCommand* cmd : cmds) {
             const int pageOf = [&] {
                 int i = 0;
                 for (const auto& p : g_room.loader->pages) {
@@ -304,35 +486,113 @@ int sb_render(int width, int height,
             batch.indexOffset = int(g_indices.size());
             batch.indexCount = cmd->numIndices;
             batch.page = pageOf;
-            batch.blend = int(cmd->blendMode);
+            // Blend 4 = white core, blend 5 = white glow (both fsWhite; the
+            // glow reuses the additive pipeline). 0..3 the spine blend modes.
+            batch.blend = style == 1 ? 4 : (style == 2 ? 5 : int(cmd->blendMode));
 
-            const float sx = float(width) / vp.width;
-            const float sy = float(height) / vp.height;
-            const float top = vp.bottom + vp.height;
             g_vertices.resize(batch.vertexOffset + cmd->numVertices);
             for (int i = 0; i < cmd->numVertices; ++i) {
                 SBBatchVertex& v = g_vertices[batch.vertexOffset + i];
-                v.x = (cmd->positions[i * 2] - vp.left) * sx;
-                v.y = (top - cmd->positions[i * 2 + 1]) * sy;
+                float px = (cmd->positions[i * 2] - vp.left) * sx;
+                float py = (top - cmd->positions[i * 2 + 1]) * sy;
+                if (puff) {
+                    px = cx + (px - cx) * puffK;
+                    py = cy + (py - cy) * puffK;
+                }
+                v.x = px;
+                v.y = py;
                 v.u = cmd->uvs[i * 2];
                 v.v = cmd->uvs[i * 2 + 1];
                 const uint32_t c = cmd->colors[i];   // packed ARGB
-                const float va = ((c >> 24) & 0xFF) / 255.0f * alpha;
-                v.r = uint8_t(((c >> 16) & 0xFF) * va + 0.5f);
-                v.g = uint8_t(((c >> 8) & 0xFF) * va + 0.5f);
-                v.b = uint8_t((c & 0xFF) * va + 0.5f);
+                // The pass alpha already lives in the slot colours (the
+                // muting block above), and render() folded it into these
+                // per-vertex colours. Multiplying by `alpha` here as well
+                // would square every fade. Straight rgb too: the shader
+                // premultiplies by the final fragment alpha, and doubling
+                // that turns every animation-keyed slot-alpha dip -- the
+                // hair ornament and clothes shimmer -- into an obvious
+                // brightness flicker.
+                const float va = ((c >> 24) & 0xFF) / 255.0f;
+                v.r = uint8_t((c >> 16) & 0xFF);
+                v.g = uint8_t((c >> 8) & 0xFF);
+                v.b = uint8_t(c & 0xFF);
                 v.a = uint8_t(va * 255.0f + 0.5f);
             }
             for (int i = 0; i < cmd->numIndices; ++i)
                 g_indices.push_back(unsigned(cmd->indices[i]) + unsigned(batch.vertexOffset));
             g_batches.push_back(batch);
         }
-        for (auto& e : passSaved) e.first->getColor().a = e.second;
+        for (auto& e : saved) {
+            spine::Color& c = e.slot->getColor();
+            c.a = e.a; c.r = e.r; c.g = e.g; c.b = e.b;
+        }
     };
 
-    emit(g_room, scene::roomViewport(width, height), 1.0f);
-    if (g_hasChar && g_charViewportValid && g_charAlpha > 0.0f)
-        emit(g_char, g_charViewport, g_charAlpha);
+    scene::Viewport rvp = scene::roomViewport(width, height);
+    const float roomWhite = g_roomCharsAlpha > 0.0f ? g_roomCharsFlash : 0.0f;
+    const float charWhite = (g_hasChar && g_charViewportValid && g_charAlpha > 0.0f)
+        ? g_charFlash : 0.0f;
+    emit(g_room, rvp, 1.0f, 0, 0);                 // the stage
+    emit(g_room, rvp, g_roomCharsAlpha, 1, 0);     // her, and the companion, leaving
+    if (roomWhite > 0.0f) {
+        emit(g_room, rvp, roomWhite * 0.80f, 1, 1);   // white core, translucent
+        for (int l = 0; l < kGlowLayers; ++l)         // stacked bloom: the light
+            emit(g_room, rvp, roomWhite * kGlowAlpha[l], 1, 2, kGlowScale[l]);
+    }
+
+    if (g_hasChar && g_charViewportValid && g_charAlpha > 0.0f) {
+        // Re-derive the camera for THIS target: width follows the real
+        // aspect so sx == sy (uniform scale), and her centre is planted at
+        // kCharXFrac of the current width. The stored viewport contributes
+        // only its height and bottom.
+        scene::Viewport cvp = g_charViewport;
+        cvp.width = cvp.height * float(width) / float(height);
+        cvp.left = g_charCenterX - kCharXFrac * cvp.width;
+        emit(g_char, cvp, g_charAlpha, 2, 0);          // arriving, in colour
+        if (charWhite > 0.0f) {
+            emit(g_char, cvp, charWhite * 0.80f, 2, 1); // white core, translucent
+            for (int l = 0; l < kGlowLayers; ++l)       // stacked bloom: the light
+                emit(g_char, cvp, charWhite * kGlowAlpha[l], 2, 2, kGlowScale[l]);
+        }
+    }
+
+    // Fullscreen fx: the drifting triangles, after everything else.
+    if (g_fx) {
+        const int fxPage = int(g_room.loader->pages.size())
+            + (g_hasChar && g_char.loader ? int(g_char.loader->pages.size()) : 0);
+        const float hScale = float(height) / 1440.0f;
+        for (size_t i = 0; i < g_fxParts.size(); ++i) {
+            const FxParticle& p = g_fxParts[i];
+            const float a = 0.5f + 0.5f * std::sin(p.phase);
+            if (a < 0.03f) continue;
+            const float px = (p.x + p.sway * std::sin(p.phase * 0.7f)) * float(width);
+            const float py = p.y * float(height);
+            const float sz = p.size * hScale;
+            const float u0 = p.flip ? 0.0f : 0.5f;
+            const float u1 = p.flip ? 0.5f : 1.0f;
+            SBBatch batch;
+            batch.vertexOffset = int(g_vertices.size());
+            batch.vertexCount = 4;
+            batch.indexOffset = int(g_indices.size());
+            batch.indexCount = 6;
+            batch.page = fxPage;
+            batch.blend = 1;   // additive: the outlines only ever add light
+            g_vertices.resize(batch.vertexOffset + 4);
+            const SBBatchVertex q[4] = {
+                { px - sz, py - sz, u0, 0, 255, 255, 255, (uint8_t)(a * 255.0f + 0.5f) },
+                { px + sz, py - sz, u1, 0, 255, 255, 255, (uint8_t)(a * 255.0f + 0.5f) },
+                { px - sz, py + sz, u0, 1, 255, 255, 255, (uint8_t)(a * 255.0f + 0.5f) },
+                { px + sz, py + sz, u1, 1, 255, 255, 255, (uint8_t)(a * 255.0f + 0.5f) },
+            };
+            for (int k = 0; k < 4; ++k) g_vertices[batch.vertexOffset + k] = q[k];
+            const unsigned short base = (unsigned short)batch.vertexOffset;
+            const unsigned short qi[6] = { base, (unsigned short)(base + 1), (unsigned short)(base + 2),
+                                           (unsigned short)(base + 1), (unsigned short)(base + 3),
+                                           (unsigned short)(base + 2) };
+            for (int k = 0; k < 6; ++k) g_indices.push_back(qi[k]);
+            g_batches.push_back(batch);
+        }
+    }
 
     *outVertices = g_vertices.data();
     *outVertexCount = int(g_vertices.size());
@@ -351,15 +611,27 @@ int sb_page_count(void) {
     int n = int(g_room.loader->pages.size());
     if (g_hasChar && g_char.loader)
         n += int(g_char.loader->pages.size());
+    if (g_fx) ++n;
     return n;
+}
+
+// Pages that belong to the ROOM. The sink uses the boundary to slot the
+// in-scene clock between the room's batches and the foreground figure's,
+// so she occludes the digits the way the reference stages it.
+int sb_room_page_count(void) {
+    return g_room.loader ? int(g_room.loader->pages.size()) : 0;
 }
 
 int sb_page(int index, const uint8_t** outRgba, int* outW, int* outH) {
     const sl::Image* img = nullptr;
-    if (index < int(g_room.loader->pages.size())) {
+    const int roomPages = int(g_room.loader->pages.size());
+    const int charPages = (g_hasChar && g_char.loader) ? int(g_char.loader->pages.size()) : 0;
+    if (index < roomPages) {
         img = g_room.loader->pages[index].get();
-    } else if (g_hasChar && index < int(g_room.loader->pages.size() + g_char.loader->pages.size())) {
-        img = g_char.loader->pages[index - int(g_room.loader->pages.size())].get();
+    } else if (g_hasChar && index < roomPages + charPages) {
+        img = g_char.loader->pages[index - roomPages].get();
+    } else if (g_fx && index == roomPages + charPages) {
+        img = g_fx.get();
     }
     if (!img) return 1;
     *outRgba = img->rgba.data();
@@ -390,9 +662,6 @@ void sb_set_mute_patterns(const char* csv) {
     }
 }
 
-void sb_set_room_char_only(int enabled) {
-    g_roomCharOnly = enabled != 0;
-}
 void sb_shutdown(void) {
     g_char = SbSlot();
     g_room = SbSlot();

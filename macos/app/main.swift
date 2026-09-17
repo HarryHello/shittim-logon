@@ -43,15 +43,33 @@ struct Config {
     var sky = true
     var clock = true
     var windowed = false
-    var skyLevel: Int = 350
-    var mutePatterns = "floor,waterlight,bg_sky,starsource,bg/sea,sea"   // room pieces hidden in the overlay         // SkyLight space level for the overlay:
+    var skyLevel: Int = 350         // SkyLight SPACE level for the overlay:
                                     // measured band: 300 and below are covered
                                     // by the lock screen, 320+ float above it
+    // The reference stages the whole room live -- flooded floor, water
+    // light, sky and stars all render, and the clock is composited INTO
+    // the scene -- so nothing is muted by default.
+    var mutePatterns = ""
 
     static func load() -> Config {
         var c = Config()
-        for path in ["shittim-mac.conf", "macos/shittim-mac.conf"] {
+
+        // Search relative to the working directory first (interactive runs),
+        // then relative to the executable (launchd / double-clicked / a shell
+        // that was standing somewhere else entirely). Without the executable
+        // fallback a run from build/ silently used every default.
+        var candidates: [String] = ["shittim-mac.conf", "macos/shittim-mac.conf"]
+        if let exec = Bundle.main.executableURL {
+            let dir = exec.deletingLastPathComponent()
+            candidates.append(dir.appendingPathComponent("shittim-mac.conf").path)
+            // build/ShittimMac -> repo-root/macos/shittim-mac.conf
+            candidates.append(dir.appendingPathComponent("../../macos/shittim-mac.conf")
+                .standardizedFileURL.path)
+        }
+
+        for path in candidates {
             guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            say("config: loading \(path)")
             for rawLine in text.split(separator: "\n") {
                 let line = rawLine.trimmingCharacters(in: .whitespaces)
                 if line.isEmpty || line.hasPrefix("#") { continue }
@@ -69,12 +87,25 @@ struct Config {
                 case "sky": c.sky = (v == "1" || v == "true")
                 case "clock": c.clock = (v == "1" || v == "true")
                 case "sky_level": c.skyLevel = Int(v) ?? c.skyLevel
-                case "mute_patterns": c.mutePatterns = v
+                case "mute_patterns":
+                    // An empty value means "keep the default"; "none" is the
+                    // explicit way to mute nothing.
+                    if v.isEmpty { break }
+                    if v.lowercased() == "none" { c.mutePatterns = "" } else { c.mutePatterns = v }
                 default: say("config: unknown key '\(k)'")
                 }
             }
-            break // first config file found wins
+            // A relative assets directory means relative to the conf's own
+            // directory, so the conf stays self-contained no matter where the
+            // binary runs from.
+            if !c.assets.hasPrefix("/") {
+                let confDir = URL(fileURLWithPath: path).deletingLastPathComponent()
+                let viaConf = confDir.appendingPathComponent(c.assets).standardizedFileURL.path
+                if FileManager.default.fileExists(atPath: viaConf) { c.assets = viaConf }
+            }
+            return c // first config file found wins
         }
+        say("config: no shittim-mac.conf found -- using built-in defaults")
         return c
     }
 }
@@ -87,8 +118,6 @@ enum Sky {
     typealias F_SpaceSetAbsoluteLevel = @convention(c) (Int32, Int32, Int32) -> Int32
     typealias F_ShowSpaces = @convention(c) (Int32, CFArray) -> Int32
     typealias F_SpaceAddWindows = @convention(c) (Int32, Int32, CFArray, Int32) -> Int32
-
-    static let levelNotificationCenterAtScreenLock: Int32 = 400
 
     static let mainConnectionID: F_MainConnectionID = sym("SLSMainConnectionID")
     static let spaceCreate: F_SpaceCreate = sym("SLSSpaceCreate")
@@ -107,12 +136,18 @@ enum Sky {
         return unsafeBitCast(p, to: T.self)
     }
 
-    static func bootstrap() {
+    // skyLevel is the SkyLight SPACE level -- the axis that decides whether
+    // the overlay floats above the lock screen at all. Measured band: 300
+    // and below are covered by the lock screen, 320+ float above everything
+    // on it (clock and password field included). Idempotent: one space per
+    // process, ever -- bootstrap twice and the first shown space leaks.
+    static func bootstrap(spaceLevel: Int32) {
+        guard connection == 0 else { return }
         connection = mainConnectionID()
         space = spaceCreate(connection, 1, 0)
-        let rc = spaceSetAbsoluteLevel(connection, space, levelNotificationCenterAtScreenLock)
+        let rc = spaceSetAbsoluteLevel(connection, space, spaceLevel)
         _ = showSpaces(connection, [space] as CFArray)
-        say("SkyLight ready: space=\(space) level=\(levelNotificationCenterAtScreenLock) rc=\(rc)")
+        say("SkyLight ready: space=\(space) absolute-level=\(spaceLevel) rc=\(rc)")
     }
 
     static func adopt(windowNumber: UInt32) -> Int32 {
@@ -186,14 +221,21 @@ final class Engine: NSObject, MTKViewDelegate {
     let window: MetalBox
     let sceneView: SceneView
     var hasCharacter = false
+    let debugWake = CommandLine.arguments.contains("--wake")
+    var debugFrames = 0
 
     var mounted = false
     var phaseArrived = false
     var charAlpha: Float = 0
+    var roomCharsAlpha: Float = 1
+    var wakeT: Float = -1            // seconds since arrival; -1 = not arrived
+    var bootT: Float = -1            // seconds since mount; drives the boot materialise
+    var fadingOut = false            // unlock fade in progress
     var lastIdle: Double = 999
     var lastFrame = Date().timeIntervalSinceReferenceDate
     var clockMinute = -1
     let clockFormatter: DateFormatter
+    let dateFormatter: DateFormatter
 
     private(set) var windowed = false
 
@@ -211,6 +253,11 @@ final class Engine: NSObject, MTKViewDelegate {
             fatalError("could not load room '\(cfg.room)' from '\(cfg.assets)'")
         }
         sb_set_mute_patterns(cfg.mutePatterns)
+        // Fullscreen fx: the drifting triangle particles (the reference's
+        // steady-state layer). Optional -- absent sprite, layer stays off.
+        if sb_load_fx((cfg.assets as NSString).appendingPathComponent("FX_TEX_Triangle_02_1.png")) != 0 {
+            say("fx: FX_TEX_Triangle_02_1.png not found -- particle layer off")
+        }
         sb_room_play(0, "Idle_background_00", 1)
         let idleName = String(format: "Idle_%02d", cfg.idle)
         if sb_room_play(1, idleName, 1) != 0 { say("room: no '\(idleName)' -- skipped") }
@@ -233,6 +280,14 @@ final class Engine: NSObject, MTKViewDelegate {
                 } else if let first = names.first(where: { $0.lowercased().contains("idle") }) {
                     sb_character_play(0, first, 1)
                     say("character: playing first Idle* -- '\(first)' (character_anim overrides)")
+                }
+                // The load-time framing measured the setup pose, which for
+                // this skeleton is a flat spread, not a standing figure -- a
+                // camera on it renders the live pose ~5x too big and leaves
+                // her headband in a corner of the screen. Re-solve on the
+                // settled animated pose now that the animation is chosen.
+                if sb_character_reframe() != 0 {
+                    say("character: reframe failed -- phase B keeps the setup-pose framing")
                 }
             } else {
                 say("character '\(cfg.character)' failed to load -- phase B stays in A")
@@ -265,25 +320,28 @@ final class Engine: NSObject, MTKViewDelegate {
                                      .canJoinAllSpaces, .ignoresCycle]
         window.canBecomeVisibleWithoutLogin = true
         if !windowed {
-            // The measured band: 300 and below are covered by the lock
-            // screen; 320+ float above it. 350 sits mid-band with margin.
+            // Same number as the sky space level, but a different axis: the
+            // space level (Sky.bootstrap) is what lifts the overlay above the
+            // lock screen; this window level only orders us within that space.
             window.level = NSWindow.Level(rawValue: cfg.skyLevel)
         }
 
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"   // 24-hour: the scene's own convention
         clockFormatter = formatter
+        let dates = DateFormatter()
+        dates.setLocalizedDateFormatFromTemplate("EEEE, MMMM d")  // "Friday, September 4"
+        dateFormatter = dates
         hasCharacter = loadedCharacter
         super.init()
 
         sv.delegate = self
         if windowed {
             makeWindowVisibleForDev()
-        } else if cfg.sky {
-            Sky.bootstrap()
-        } else {
+        } else if !cfg.sky {
             say("sky mount disabled (sky=0) -- window stays a plain desktop window")
         }
+        // Sky.bootstrap happens once, in main, with the configured space level.
         syncDrawableSize()
     }
 
@@ -313,17 +371,46 @@ final class Engine: NSObject, MTKViewDelegate {
             window.orderFrontRegardless()
             let rc = Sky.adopt(windowNumber: UInt32(window.windowNumber))
             sceneView.isPaused = false
+            // The room's characters materialise in with the white-glow
+            // effect (the reference's boot phase), then the scene idles.
+            roomCharsAlpha = 0
+            bootT = -1
+            clockMinute = -1
+            // Seed the arrival detector with the REAL idle time: the
+            // keystroke that locked the session must not count as an
+            // arrival, or the foreground skips the boot phase entirely.
+            lastIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
+                                                              eventType: anyInput)
             lastFrame = Date().timeIntervalSinceReferenceDate
-            lastIdle = 999
             say("mounted over lock screen (adopt rc=\(rc))")
         } else {
-            sceneView.isPaused = true
+            // Unlock: the scene dissolves -- a last white glow while the
+            // window fades, then everything resets for the next lock.
+            fadingOut = true
             phaseArrived = false
-            charAlpha = 0
-            sb_set_character_alpha(0)
-            window.alphaValue = 1
-            window.orderOut(nil)
-            say("unmounted (session unlocked)")
+            wakeT = -1
+            bootT = -1
+            sceneView.isPaused = false
+            sb_set_character_flash(0.6)
+            sb_set_room_chars_flash(0.6)
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.32
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                window.animator().alphaValue = 0.0
+            }, completionHandler: { [weak self] in
+                guard let self else { return }
+                window.alphaValue = 1.0
+                window.orderOut(nil)
+                sceneView.isPaused = true
+                fadingOut = false
+                charAlpha = 0
+                roomCharsAlpha = 1
+                sb_set_character_alpha(0)
+                sb_set_room_chars_alpha(1)
+                sb_set_character_flash(0)
+                sb_set_room_chars_flash(0)
+                say("unmounted (session unlocked)")
+            })
         }
     }
 
@@ -332,35 +419,98 @@ final class Engine: NSObject, MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        guard mounted || windowed else { return }
+        guard mounted || fadingOut || windowed else { return }
         let now = Date().timeIntervalSinceReferenceDate
         var dt = Float(now - lastFrame)
         lastFrame = now
         if dt <= 0 || dt > 0.25 { dt = 1.0 / 60.0 }
 
+        // Boot materialise: the room's characters ignite into the scene with
+        // the white-glow effect, then the scene idles (the reference's boot
+        // phase, recorded at ~0.7 s into the lock).
+        if mounted {
+            if bootT < 0 { bootT = 0 }
+            if bootT < 0.8 {
+                bootT = min(bootT + dt, 0.8)
+                roomCharsAlpha = min(1.0, bootT / 0.55)
+                sb_set_room_chars_alpha(roomCharsAlpha)
+                let f: Float = bootT < 0.12 ? bootT / 0.12
+                    : bootT < 0.26 ? 1.0
+                    : bootT < 0.75 ? 1.0 - (bootT - 0.26) / 0.49
+                    : 0.0
+                sb_set_room_chars_flash(f)
+            }
+        }
+
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
                                                            eventType: anyInput)
+        // --wake: debug trigger so the wake timeline can be recorded from
+        // the desktop without locking. Fires at frame 150 (~2.5 s in), late
+        // enough for a capture burst to be running first.
+        if debugWake {
+            debugFrames += 1
+            if debugFrames == 150 && hasCharacter && !phaseArrived {
+                phaseArrived = true
+                say("debug wake")
+            }
+        }
         if !phaseArrived && hasCharacter && lastIdle > 5.0 && idle < 1.0 {
             phaseArrived = true
             say(String(format: "arrival detected (idle %.1f -> %.1f) -- phase B", lastIdle, idle))
         }
         lastIdle = idle
 
-        if phaseArrived && hasCharacter && charAlpha < 1.0 {
-            charAlpha = min(1.0, charAlpha + dt / 0.8)
-            sb_set_character_alpha(charAlpha)
+        if phaseArrived && hasCharacter {
+            // The wake, as the material stages it: both figures flash white
+            // in the same frame, each with its own tint (reference keyframe
+            // #23); the foreground resolves from a white silhouette into
+            // herself while the room's characters flash and leave.
+            if wakeT < 0 { wakeT = 0 }
+            wakeT += dt
+            let t = wakeT
+
+            // Foreground: alpha fades in over 0.8 s; the flash spikes to
+            // full within 0.12 s, holds a beat, then falls away -- a white
+            // silhouette that resolves into her colours.
+            let newAlpha = min(1.0, charAlpha + dt / 0.8)
+            if newAlpha != charAlpha { charAlpha = newAlpha; sb_set_character_alpha(charAlpha) }
+            let flash: Float
+            if t < 0.12 { flash = t / 0.12 }
+            else if t < 0.22 { flash = 1 }
+            else if t < 0.57 { flash = 1 - (t - 0.22) / 0.35 }
+            else { flash = 0 }
+            sb_set_character_flash(flash)
+
+            // Room characters: same flash shape as they leave, fade over 0.8 s.
+            let newRoom = max(0.0, roomCharsAlpha - dt / 0.8)
+            if newRoom != roomCharsAlpha { roomCharsAlpha = newRoom; sb_set_room_chars_alpha(roomCharsAlpha) }
+            let roomFlash: Float
+            if t < 0.10 { roomFlash = t / 0.10 }
+            else if t < 0.20 { roomFlash = 1 }
+            else if t < 0.55 { roomFlash = 1 - (t - 0.20) / 0.35 }
+            else { roomFlash = 0 }
+            sb_set_room_chars_flash(roomFlash)
+
+            // Latched for the whole mount: the wake plays once per lock,
+            // not again on every idle gap while the screen is up.
+            if wakeT > 1.0 { wakeT = 1.0 }
         }
 
         if cfg.clock {
             let minute = Calendar.current.component(.minute, from: Date())
             if minute != clockMinute {
                 clockMinute = minute
-                renderer.clockTexture = renderer.makeTextTexture(
-                    text: clockFormatter.string(from: Date()), fontSize: 108)
-                let cw = Float(min(720.0, Double(sceneView.bounds.width) * 0.4))
-                let ch: Float = 160
-                renderer.clockRect = CGRect(x: (sceneView.bounds.width - CGFloat(cw)) / 2,
-                                            y: sceneView.bounds.height - CGFloat(ch) - 40,
+                let now = Date()
+                renderer.clockTexture = renderer.makeClockTexture(
+                    time: clockFormatter.string(from: now),
+                    date: dateFormatter.string(from: now))
+                // Pixel space (the drawable), top-centre, sized from the
+                // drawable so the clock keeps its proportions at any scale.
+                let dw = sceneView.drawableSize
+                let cw = Float(min(880.0, Float(dw.width) * 0.30))
+                let ch = cw * 380.0 / 900.0
+                renderer.clockRect = CGRect(x: (dw.width - CGFloat(cw)) / 2,
+                                            y: CGFloat(dw.height * 0.16),
                                             width: CGFloat(cw), height: CGFloat(ch))
             }
         }
@@ -389,7 +539,8 @@ if engine.windowed {
     (engine.sceneView.layer as? CAMetalLayer)?.isOpaque = false
     app.activate(ignoringOtherApps: true)
 } else if engine.cfg.sky {
-    Sky.bootstrap()                    // sky mode: window is already fullscreen;
+    Sky.bootstrap(spaceLevel: Int32(engine.cfg.skyLevel))
+                                       // sky mode: window is already fullscreen;
                                        // it mounts over the lock on lock
 } else {
     say("sky mount disabled (sky=0) -- plain desktop window")

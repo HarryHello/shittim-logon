@@ -43,6 +43,12 @@ int sb_load_room(const char* assetsDir, const char* roomName);
 // Returns 0 on success, non-zero if the skeleton is absent or unreadable.
 int sb_load_character(const char* assetsDir, const char* characterName);
 
+// Re-solve the foreground camera on the settled animated pose (~2 s of
+// mixes and physics). Call once after the character's animation is chosen;
+// the framing sb_load_character did is a fallback on the setup pose, which
+// for this skeleton is not a standing figure and magnifies the live pose.
+int sb_character_reframe(void);
+
 // Play an animation by name on a skeleton. Returns 0 if it exists (spine-cpp
 // aborts on unknown names; this refuses instead -- logon-screen rule).
 int sb_room_play(int track, const char* animation, int loop);
@@ -60,6 +66,18 @@ void sb_tick(float dt);
 // Character opacity for the A->B transition (0 = hidden, 1 = on stage).
 void sb_set_character_alpha(float alpha);
 
+// Opacity of the characters living INSIDE the room (seated figure, her
+// companion). Ramp to 0 as the foreground character fades in on wake; the
+// two transitions read as her stepping out of the scene.
+void sb_set_room_chars_alpha(float alpha);
+
+// The wake's white-silhouette tint flash, per figure: 1 = pure white
+// silhouette, 0 = normal colours. The foreground flashes as she
+// materialises; the room characters flash as they leave (reference
+// keyframe #23).
+void sb_set_character_flash(float flash);
+void sb_set_room_chars_flash(float flash);
+
 // Pose and emit the frame as pixel-space triangle batches. The room renders
 // in its own draw order; the foreground character renders above it, framed
 // by its own camera.
@@ -73,15 +91,23 @@ int sb_render(int width, int height,
 int sb_page_count(void);
 int sb_page(int index, const uint8_t** outRgba, int* outW, int* outH);
 
-// Protect rects (fractions of the screen): scene elements whose screen
-// bounds intersect a protect rect are muted (alpha 0) for the frame, so the
-// system clock and password field read through unoccluded. The classroom
-// backdrop spans the whole screen and is muted by the same rule.
+// Pages belonging to the room skeleton (the rest belong to the foreground
+// character; the sink draws the in-scene clock between the two groups).
+int sb_room_page_count(void);
+
+// Load the fullscreen-fx particle sprite (e.g. "FX_TEX_Triangle_02_1.png")
+// as an extra atlas page. Optional; returns non-zero if absent (the
+// particle layer simply stays off).
+int sb_load_fx(const char* pngPath);
+
+// Protect rects (fractions of the screen, top-left origin): room elements
+// whose screen bounds intersect a protect rect are muted (alpha 0) for the
+// frame, so the system clock and password field read through unoccluded.
 void sb_set_protect_rects(float clockX, float clockY, float clockW, float clockH,
                           float pwdX, float pwdY, float pwdW, float pwdH);
 
-void sb_set_room_char_only(int enabled);
-
+// The room's single muting knob: comma-separated substrings matched against
+// each attachment path (lowercased). An empty list mutes nothing.
 void sb_set_mute_patterns(const char* csv);
 
 void sb_shutdown(void);
