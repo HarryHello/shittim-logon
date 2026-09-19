@@ -228,8 +228,18 @@ final class Engine: NSObject, MTKViewDelegate {
     var phaseArrived = false
     var charAlpha: Float = 0
     var roomCharsAlpha: Float = 1
+    // The wake, as 1.3.0's spine_layer stages it: the room's characters
+    // react (their Touch animation), then FREEZE at tExit and dissolve
+    // under the exit flash (blue-white), and the foreground appears at
+    // tEnter = tExit + 0.4 under her own flash (pink, PlanaTint).
     var wakeT: Float = -1            // seconds since arrival; -1 = not arrived
+    var wakePhase = 0                // 0 idle, 1 reacting, 2 exiting, 3 entering, 4 present
+    var reactionDur: Float = 0.6
+    var tExit: Float = 0.0, tEnter: Float = 0.0
+    var planaStarted = false
+    var enterPending = false         // one-frame lag: pose the fg before its silhouette bake
     var bootT: Float = -1            // seconds since mount; drives the boot materialise
+    var bootGlowDone = false         // the boot's ignition glow fires once, on frame 2
     var fadingOut = false            // unlock fade in progress
     var lastIdle: Double = 999
     var lastFrame = Date().timeIntervalSinceReferenceDate
@@ -333,6 +343,12 @@ final class Engine: NSObject, MTKViewDelegate {
         dates.setLocalizedDateFormatFromTemplate("EEEE, MMMM d")  // "Friday, September 4"
         dateFormatter = dates
         hasCharacter = loadedCharacter
+        // The arrival detector seeds with the real idle even in the windowed
+        // dev run: left at its 999 default, the desktop's own activity
+        // ("idle" ~0) trips the trigger on the first frame and the wake plays
+        // before any capture can see it.
+        lastIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
+                                                          eventType: anyInput)
         super.init()
 
         sv.delegate = self
@@ -371,10 +387,19 @@ final class Engine: NSObject, MTKViewDelegate {
             window.orderFrontRegardless()
             let rc = Sky.adopt(windowNumber: UInt32(window.windowNumber))
             sceneView.isPaused = false
-            // The room's characters materialise in with the white-glow
-            // effect (the reference's boot phase), then the scene idles.
+            // The room's characters ignite in with the arrival flash (the
+            // reference's boot phase -- its white->blue AronaTint glow), then
+            // the scene idles.
             roomCharsAlpha = 0
             bootT = -1
+            bootGlowDone = false
+            wakeT = -1
+            wakePhase = 0
+            planaStarted = false
+            enterPending = false
+            charAlpha = 0
+            sb_set_character_alpha(0)
+            sb_fx_reset()
             clockMinute = -1
             // Seed the arrival detector with the REAL idle time: the
             // keystroke that locked the session must not count as an
@@ -384,15 +409,26 @@ final class Engine: NSObject, MTKViewDelegate {
             lastFrame = Date().timeIntervalSinceReferenceDate
             say("mounted over lock screen (adopt rc=\(rc))")
         } else {
-            // Unlock: the scene dissolves -- a last white glow while the
-            // window fades, then everything resets for the next lock.
+            // Unlock: the scene dissolves -- the exit flash runs (its frozen
+            // room under the blue-white glow) while the window fades, then
+            // everything resets for the next lock.
             fadingOut = true
             phaseArrived = false
             wakeT = -1
+            wakePhase = 0
+            planaStarted = false
+            enterPending = false
             bootT = -1
             sceneView.isPaused = false
-            sb_set_character_flash(0.6)
-            sb_set_room_chars_flash(0.6)
+            // The exit flash only means something while the room's
+            // characters are still on stage; after the wake they are gone
+            // and the fade-out carries the scene alone.
+            if roomCharsAlpha > 0.0 {
+                sb_fx_begin(0)
+                renderer.captureRequest = 1
+                roomCharsAlpha = 0
+                sb_set_room_chars_alpha(0)
+            }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.32
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
@@ -407,8 +443,7 @@ final class Engine: NSObject, MTKViewDelegate {
                 roomCharsAlpha = 1
                 sb_set_character_alpha(0)
                 sb_set_room_chars_alpha(1)
-                sb_set_character_flash(0)
-                sb_set_room_chars_flash(0)
+                sb_fx_reset()
                 say("unmounted (session unlocked)")
             })
         }
@@ -426,19 +461,20 @@ final class Engine: NSObject, MTKViewDelegate {
         if dt <= 0 || dt > 0.25 { dt = 1.0 / 60.0 }
 
         // Boot materialise: the room's characters ignite into the scene with
-        // the white-glow effect, then the scene idles (the reference's boot
-        // phase, recorded at ~0.7 s into the lock).
+        // the arrival flash's tinted glow, then the scene idles (the
+        // reference's boot phase, recorded at ~0.7 s into the lock).
         if mounted {
-            if bootT < 0 { bootT = 0 }
+            if bootT < 0 {
+                bootT = 0                      // first frame: the world is still warming up
+            } else if bootGlowDone == false && bootT < 0.8 {
+                bootGlowDone = true
+                sb_fx_begin(2)                 // the ignition glow (AronaTint), now that
+                renderer.captureRequest = 0    // the render size exists for a snapshot
+            }
             if bootT < 0.8 {
                 bootT = min(bootT + dt, 0.8)
                 roomCharsAlpha = min(1.0, bootT / 0.55)
                 sb_set_room_chars_alpha(roomCharsAlpha)
-                let f: Float = bootT < 0.12 ? bootT / 0.12
-                    : bootT < 0.26 ? 1.0
-                    : bootT < 0.75 ? 1.0 - (bootT - 0.26) / 0.49
-                    : 0.0
-                sb_set_room_chars_flash(f)
             }
         }
 
@@ -461,39 +497,79 @@ final class Engine: NSObject, MTKViewDelegate {
         lastIdle = idle
 
         if phaseArrived && hasCharacter {
-            // The wake, as the material stages it: both figures flash white
-            // in the same frame, each with its own tint (reference keyframe
-            // #23); the foreground resolves from a white silhouette into
-            // herself while the room's characters flash and leave.
+            // The wake, as upstream's spine_layer stages it. The trigger
+            // plays the room's Touch reaction once and arms the timeline:
+            //   tExit  = reaction ends (max(0.12, reactionDur - 0.15))
+            //   tEnter = tExit + 0.4 (fx_layer's kExitToEnterLag)
+            // At tExit the room FREEZES into a snapshot and dissolves under
+            // the exit flash; at tEnter the foreground appears under her own
+            // tint; both glows overlap for ~0.1 s -- the recording's
+            // keyframe #23, both figures lit at once, each its own colour.
             if wakeT < 0 { wakeT = 0 }
             wakeT += dt
             let t = wakeT
 
-            // Foreground: alpha fades in over 0.8 s; the flash spikes to
-            // full within 0.12 s, holds a beat, then falls away -- a white
-            // silhouette that resolves into her colours.
-            let newAlpha = min(1.0, charAlpha + dt / 0.8)
-            if newAlpha != charAlpha { charAlpha = newAlpha; sb_set_character_alpha(charAlpha) }
-            let flash: Float
-            if t < 0.12 { flash = t / 0.12 }
-            else if t < 0.22 { flash = 1 }
-            else if t < 0.57 { flash = 1 - (t - 0.22) / 0.35 }
-            else { flash = 0 }
-            sb_set_character_flash(flash)
+            if wakePhase == 0 {
+                wakePhase = 1
+                // The exit's frozen image is captured NOW -- while the
+                // characters are still intact at their desks. The Touch
+                // reaction plays out live over the next second; at tExit the
+                // frozen capture dissolves under the flash instead of
+                // whatever state the reaction has reached by then.
+                sb_fx_arm(0)
+                renderer.captureRequest = 1
+                reactionDur = 0.6
+                for nm in [String(format: "Idle_%02d_Touch_M", cfg.idle),
+                           String(format: "Idle_%02d_Touch_A", cfg.idle)] {
+                    let d = sb_animation_duration(nm)
+                    if d > 0 {
+                        reactionDur = max(reactionDur, Float(d))
+                        sb_room_play(2, nm, 0)
+                    }
+                }
+                if cfg.companion > 0 {
+                    for nm in [String(format: "Idle_%02d_Touch_M", cfg.companion),
+                               String(format: "Idle_%02d_Touch_A", cfg.companion)] {
+                        let d = sb_animation_duration(nm)
+                        if d > 0 {
+                            reactionDur = max(reactionDur, Float(d))
+                            sb_room_play(5, nm, 0)
+                        }
+                    }
+                }
+                tExit = max(0.12, reactionDur - 0.15)
+                tEnter = tExit + 0.4
+                sb_fx_begin(2)                    // arrival flash on the room's characters
+                say(String(format: "wake: reaction %.3fs, exit @%.3f, enter @%.3f",
+                           reactionDur, tExit, tEnter))
+            }
 
-            // Room characters: same flash shape as they leave, fade over 0.8 s.
-            let newRoom = max(0.0, roomCharsAlpha - dt / 0.8)
-            if newRoom != roomCharsAlpha { roomCharsAlpha = newRoom; sb_set_room_chars_alpha(roomCharsAlpha) }
-            let roomFlash: Float
-            if t < 0.10 { roomFlash = t / 0.10 }
-            else if t < 0.20 { roomFlash = 1 }
-            else if t < 0.55 { roomFlash = 1 - (t - 0.20) / 0.35 }
-            else { roomFlash = 0 }
-            sb_set_room_chars_flash(roomFlash)
-
-            // Latched for the whole mount: the wake plays once per lock,
-            // not again on every idle gap while the screen is up.
-            if wakeT > 1.0 { wakeT = 1.0 }
+            if wakePhase == 1 && t >= tExit {
+                wakePhase = 2
+                sb_fx_begin(0)                    // light the armed, frozen capture
+                renderer.captureRequest = 0
+                roomCharsAlpha = 0                // the live characters yield to the snapshot
+                sb_set_room_chars_alpha(0)
+            }
+            if wakePhase >= 2 && t >= tEnter && !planaStarted {
+                wakePhase = 3
+                planaStarted = true
+                enterPending = true               // pose her this frame, bake next
+                sb_drift_start()
+                charAlpha = 1
+                sb_set_character_alpha(1)
+            }
+            if wakePhase == 3 && enterPending && sb_fx_active(1) == 0 {
+                // One frame in: the foreground is posed and drawn in colour
+                // once, so the silhouette bake sees a standing figure.
+                wakePhase = 3
+                enterPending = false
+                sb_fx_begin(1)
+                renderer.captureRequest = 2
+            }
+            if wakePhase == 3 && planaStarted && sb_fx_active(1) == 0 && t > tEnter + 0.9 {
+                wakePhase = 4
+            }
         }
 
         if cfg.clock {

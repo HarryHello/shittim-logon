@@ -38,3 +38,9 @@ macos/spine/src/
 # the mechanism is synced into adapter/. The real scene table and the extracted
 # game assets live under it -- same policy as assets/: never committed.
 shittim-logon-*-src/
+
+# The macOS app's local config (asset paths are machine-specific; the
+# committed template is macos/shittim-mac.conf.example) and the extracted
+# assets directory -- same never-commit policy as above.
+assets/
+macos/shittim-mac.conf

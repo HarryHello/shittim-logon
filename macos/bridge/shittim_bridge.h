@@ -31,6 +31,8 @@ typedef struct SBBatch {
     int indexCount;
     int page;           // atlas page index (sb_page)
     int blend;          // 0 normal, 1 additive, 2 multiply, 3 screen
+    int pass;           // 0 room stage, 1 room characters, 2 foreground,
+                        // 3 flash burst, 4 drift halo, 5 drift body
 } SBBatch;
 
 // ---- lifecycle ------------------------------------------------------
@@ -71,12 +73,51 @@ void sb_set_character_alpha(float alpha);
 // two transitions read as her stepping out of the scene.
 void sb_set_room_chars_alpha(float alpha);
 
-// The wake's white-silhouette tint flash, per figure: 1 = pure white
-// silhouette, 0 = normal colours. The foreground flashes as she
-// materialises; the room characters flash as they leave (reference
-// keyframe #23).
-void sb_set_character_flash(float flash);
-void sb_set_room_chars_flash(float flash);
+// ---- the wake's flash, the 1.3.0 way ---------------------------------
+//
+// No white silhouette: a flash is an additive glow in the figure's tint
+// colour (the room characters flash white->blue, the foreground pink->
+// magenta -- PlanaTint/AronaTint in fx_layer.h) accumulated over the
+// figure's silhouette, run through a bloom, plus a burst of the
+// FX_TEX_Triangle outlines from the silhouette's own points. The figure
+// itself is drawn in full colour underneath; the glow decays over 0.5 s
+// and she "resolves" out of her own light.
+//
+// kind: 0 = the room characters' exit flash, 1 = the foreground's
+// entrance flash, 2 = the room characters' arrival flash (also the boot
+// ignition). sb_fx_begin captures that figure's batch geometry and
+// silhouette ONCE into a snapshot (sb_snapshot) that the sink renders
+// while the flash runs.
+// Two-step arming, for the exit flash: sb_fx_arm captures the figure NOW
+// (intact, before the Touch reaction gets under way) without lighting the
+// flash; sb_fx_begin later lights the frozen capture from t=0. Without a
+// prior arm, sb_fx_begin captures and lights in one step (boot, arrival).
+void sb_fx_arm(int kind);
+void sb_fx_begin(int kind);
+int   sb_fx_active(int kind);
+float sb_fx_mag(int kind);                  // magnitude envelope, 0 when inactive
+void  sb_fx_color(int kind, float out[3]);  // tint * gain * magnitude
+void  sb_fx_reset(void);                    // clear all flashes + drift (next mount)
+
+// The snapshot a flash captured, valid until the next sb_fx_begin of the
+// same kind. kind 0 = the WHOLE room (the exit's dissolve image, stage
+// included so the desk keeps occluding); kind 1 = the foreground; kind 2 =
+// the room's CHARACTERS only -- the exit glow's silhouette, which must not
+// take its alpha from the walls. Returns 1 and leaves the outputs null
+// when nothing has been captured for that kind yet.
+int sb_snapshot(int kind,
+                const SBBatchVertex** outVertices, int* outVertexCount,
+                const unsigned short** outIndices, int* outIndexCount,
+                const SBBatch** outBatches, int* outBatchCount);
+
+// Turn the drifting-particle layer on (the official Drift: pastel solid
+// triangles with soft halos, tumbling). Starts when the foreground
+// character begins her entrance, like upstream.
+void sb_drift_start(void);
+
+// Duration of a room animation by name, in seconds (0 if absent) -- the
+// wake's reaction length comes from the Touch animations' own tracks.
+float sb_animation_duration(const char* name);
 
 // Pose and emit the frame as pixel-space triangle batches. The room renders
 // in its own draw order; the foreground character renders above it, framed
@@ -95,9 +136,9 @@ int sb_page(int index, const uint8_t** outRgba, int* outW, int* outH);
 // character; the sink draws the in-scene clock between the two groups).
 int sb_room_page_count(void);
 
-// Load the fullscreen-fx particle sprite (e.g. "FX_TEX_Triangle_02_1.png")
-// as an extra atlas page. Optional; returns non-zero if absent (the
-// particle layer simply stays off).
+// Load the flash-burst particle sprite (e.g. "FX_TEX_Triangle_02_1.png")
+// as an extra atlas page. Optional; returns non-zero if absent (the burst
+// simply stays off).
 int sb_load_fx(const char* pngPath);
 
 // Protect rects (fractions of the screen, top-left origin): room elements
